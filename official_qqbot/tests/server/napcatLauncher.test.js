@@ -15,6 +15,22 @@ test("Linux NapCat startup script is present and dispatches to the launcher", ()
   assert.match(script, /--instance=\$INSTANCE/);
 });
 
+test("Linux NapCat startup script preloads QQ magic shim and gnutls", () => {
+  const scriptPath = path.join(ROOT_DIR, "scripts", "start-napcat-instance.sh");
+  const shimPath = path.join(ROOT_DIR, "scripts", "napcat-qqmagic-shim.c");
+
+  assert.equal(fs.existsSync(shimPath), true);
+  const script = fs.readFileSync(scriptPath, "utf-8");
+  const shimSource = fs.readFileSync(shimPath, "utf-8");
+
+  assert.match(shimSource, /qq_magic_napi_register/);
+  assert.match(shimSource, /napi_module_register/);
+  assert.match(script, /napcat-qqmagic-shim\.c/);
+  assert.match(script, /libnapcat-qqmagic\.so/);
+  assert.match(script, /LD_PRELOAD/);
+  assert.match(script, /libgnutls\.so\.30/);
+});
+
 test("NapCat launcher resolves Linux bot config paths and per-instance overrides", () => {
   process.env.NAPCAT_LAUNCHER_TEST = "1";
   const { getInstanceConfig } = require("../../scripts/napcat-launcher.cjs");
