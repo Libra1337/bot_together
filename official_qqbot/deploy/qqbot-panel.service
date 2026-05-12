@@ -1,0 +1,18 @@
+[Unit]
+Description=Official QQ Bot Management Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/official_qqbot
+ExecStart=/opt/official_qqbot/scripts/start-panel.sh
+Restart=always
+RestartSec=5
+User=qqbot
+Group=qqbot
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+

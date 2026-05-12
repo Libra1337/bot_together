@@ -1,0 +1,11 @@
+{
+  "id": "echo_node",
+  "name": "Echo Node",
+  "description": "Node.js 外部命令插件示例，发送 /echo 内容 返回内容。",
+  "type": "external",
+  "command": "node",
+  "args": ["plugin.js"],
+  "commands": ["/echo"],
+  "enabled": true
+}
+

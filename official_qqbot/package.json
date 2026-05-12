@@ -1,0 +1,14 @@
+{
+  "name": "official-qqbot-panel",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Node.js management panel for the official QQ bot.",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test tests/server/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+

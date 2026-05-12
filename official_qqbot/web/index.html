@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QQ Bot 控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main id="loginView" class="login-shell">
+      <section class="login-panel">
+        <div>
+          <p class="eyebrow">Official QQ Bot</p>
+          <h1>控制台登录</h1>
+        </div>
+        <form id="loginForm" class="stack">
+          <label>
+            用户名
+            <input id="username" name="username" autocomplete="username" required value="admin" />
+          </label>
+          <label>
+            密码
+            <input id="password" name="password" type="password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">登录</button>
+          <p id="loginError" class="error"></p>
+        </form>
+      </section>
+    </main>
+
+    <main id="appView" class="app-shell hidden">
+      <aside class="sidebar">
+        <div>
+          <p class="eyebrow">Official QQ Bot</p>
+          <h1>控制台</h1>
+        </div>
+        <nav>
+          <button class="nav-item active" data-view="overview">概览</button>
+          <button class="nav-item" data-view="logs">日志</button>
+          <button class="nav-item" data-view="plugins">插件</button>
+          <button class="nav-item" data-view="config">配置</button>
+        </nav>
+        <button id="logoutBtn" class="ghost">退出登录</button>
+      </aside>
+
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">运行状态</p>
+            <h2 id="statusTitle">读取中</h2>
+          </div>
+          <div class="actions">
+            <button id="refreshBtn" class="ghost">刷新</button>
+          </div>
+        </header>
+
+        <section id="overview" class="view active">
+          <div class="metrics">
+            <article>
+              <span>进程</span>
+              <strong id="pidValue">-</strong>
+            </article>
+            <article>
+              <span>运行时间</span>
+              <strong id="uptimeValue">-</strong>
+            </article>
+            <article>
+              <span>插件数</span>
+              <strong id="pluginCount">-</strong>
+            </article>
+          </div>
+          <section class="panel">
+            <div class="panel-title">
+              <h3>服务控制</h3>
+              <span id="serviceSummary" class="muted">-</span>
+            </div>
+            <div id="serviceList" class="service-list"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-title">
+              <h3>最近日志</h3>
+              <span class="muted">全部服务</span>
+            </div>
+            <pre id="recentLogs" class="log-box"></pre>
+          </section>
+        </section>
+
+        <section id="logs" class="view">
+          <section class="panel tall">
+            <div class="panel-title">
+              <h3>实时日志</h3>
+              <div class="actions">
+                <select id="logServiceFilter" class="select-control">
+                  <option value="">全部服务</option>
+                </select>
+                <button id="clearLogsBtn" class="ghost">清空显示</button>
+              </div>
+            </div>
+            <pre id="fullLogs" class="log-box fill"></pre>
+          </section>
+        </section>
+
+        <section id="plugins" class="view">
+          <section class="panel">
+            <div class="panel-title">
+              <h3>插件管理</h3>
+              <button id="reloadPluginsBtn" class="ghost">刷新</button>
+            </div>
+            <div id="pluginList" class="plugin-list"></div>
+          </section>
+        </section>
+
+        <section id="config" class="view">
+          <section class="panel">
+            <h3>部署配置</h3>
+            <dl class="config-list">
+              <dt>监听地址</dt>
+              <dd id="cfgHost">-</dd>
+              <dt>Bot 命令</dt>
+              <dd id="cfgCommand">-</dd>
+              <dt>服务数量</dt>
+              <dd id="cfgServices">-</dd>
+              <dt>插件目录</dt>
+              <dd id="cfgPlugins">-</dd>
+            </dl>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <script src="/serviceUi.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "id": "hello_python",
+  "name": "Hello Python",
+  "description": "Python 插件示例，发送 /hello 返回问候。",
+  "type": "python",
+  "entry": "plugin.py",
+  "commands": ["/hello"],
+  "enabled": true
+}
+
