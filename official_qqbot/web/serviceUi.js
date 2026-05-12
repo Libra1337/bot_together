@@ -14,10 +14,40 @@ function blockedStartHint(service = {}) {
   return `还不能启动：${message}。请先打开对应 NapCat WebUI 扫码登录，等 OneBot 端口连通后再启动。`;
 }
 
+function resolveServiceWebUrl(serviceWebUrl = "", currentHost = "") {
+  if (!serviceWebUrl) return "";
+
+  try {
+    const url = new URL(serviceWebUrl, "http://localhost");
+    if (currentHost && ["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
+      url.hostname = currentHost;
+    }
+    return url.toString();
+  } catch {
+    if (currentHost && /\/\/(?:127\.0\.0\.1|localhost|::1)(?::\d+)?/i.test(serviceWebUrl)) {
+      return serviceWebUrl.replace(
+        /\/\/(?:127\.0\.0\.1|localhost|::1)(?::\d+)?/i,
+        `//${currentHost}`
+      );
+    }
+    return serviceWebUrl;
+  }
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { canStartService, startDisabledReason, blockedStartHint };
+  module.exports = {
+    canStartService,
+    startDisabledReason,
+    blockedStartHint,
+    resolveServiceWebUrl,
+  };
 }
 
 if (typeof window !== "undefined") {
-  window.serviceUi = { canStartService, startDisabledReason, blockedStartHint };
+  window.serviceUi = {
+    canStartService,
+    startDisabledReason,
+    blockedStartHint,
+    resolveServiceWebUrl,
+  };
 }

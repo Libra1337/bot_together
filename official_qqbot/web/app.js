@@ -103,7 +103,9 @@ function healthText(service) {
 
 function webUrlButton(service) {
   if (!service.webUrl) return "";
-  return `<a class="button ghost" href="${escapeHtml(service.webUrl)}" target="_blank" rel="noreferrer">打开 WebUI</a>`;
+  const webUrl =
+    serviceUi.resolveServiceWebUrl?.(service.webUrl, window.location.hostname) || service.webUrl;
+  return `<a class="button ghost" href="${escapeHtml(webUrl)}" target="_blank" rel="noreferrer">打开 WebUI</a>`;
 }
 
 function startTitle(service) {
@@ -279,10 +281,13 @@ $("#serviceList").addEventListener("click", async (event) => {
   try {
     const result = await api(`/api/services/${id}/${action}`, { method: "POST" });
     if (action === "start" && result.service?.webUrl) {
+      const webUrl =
+        serviceUi.resolveServiceWebUrl?.(result.service.webUrl, window.location.hostname) ||
+        result.service.webUrl;
       if (webWindow) {
-        webWindow.location.href = result.service.webUrl;
+        webWindow.location.href = webUrl;
       } else {
-        window.open(result.service.webUrl, "_blank", "noopener,noreferrer");
+        window.open(webUrl, "_blank", "noopener,noreferrer");
       }
     } else if (webWindow) {
       webWindow.close();

@@ -119,6 +119,7 @@ systemctl enable --now qqbot-panel
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 8787/tcp || true
+  ufw allow 6199/tcp || true
 fi
 
 echo "Panel status:"

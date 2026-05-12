@@ -1,7 +1,11 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { canStartService, startDisabledReason } = require("../../web/serviceUi");
+const {
+  canStartService,
+  startDisabledReason,
+  resolveServiceWebUrl,
+} = require("../../web/serviceUi");
 
 test("blocked services keep the start button clickable", () => {
   const service = {
@@ -24,4 +28,19 @@ test("running and disabled services still cannot be started", () => {
   assert.equal(startDisabledReason({ running: true, disabled: false }), "服务已在运行");
   assert.equal(canStartService({ running: false, disabled: true }), false);
   assert.equal(startDisabledReason({ running: false, disabled: true }), "服务未配置");
+});
+
+test("service WebUI urls can be rewritten away from localhost", () => {
+  assert.equal(
+    resolveServiceWebUrl("http://127.0.0.1:6199/webui?token=abc", "103.116.247.157"),
+    "http://103.116.247.157:6199/webui?token=abc"
+  );
+  assert.equal(
+    resolveServiceWebUrl("http://localhost:6200/webui?token=abc", "example.com"),
+    "http://example.com:6200/webui?token=abc"
+  );
+  assert.equal(
+    resolveServiceWebUrl("http://10.0.0.1:6199/webui?token=abc", "example.com"),
+    "http://10.0.0.1:6199/webui?token=abc"
+  );
 });

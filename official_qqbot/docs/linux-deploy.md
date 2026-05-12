@@ -26,7 +26,7 @@ cd /opt/official_qqbot
 sudo -u qqbot bash scripts/start-panel.sh
 ```
 
-面板默认监听 `0.0.0.0:8787`，首次运行会生成 `data/panel.json`。
+面板默认监听 `0.0.0.0:8787`，首次运行会生成 `data/panel.json`。如果要直接打开 NapCat WebUI，请确保 `6199/tcp` 对浏览器所在网络可达，安装脚本已经默认放行该端口。
 
 默认账号是：
 
