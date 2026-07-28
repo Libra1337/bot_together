@@ -45,6 +45,47 @@ journalctl -u official-qqbot -f
 journalctl -u official-qqbot-api -f
 ```
 
+## Update Existing Non-Git Install
+
+If `/opt/official_qqbot` was copied from a tarball or with `rsync`, it is not a git repository. In that case `git pull` inside `/opt/official_qqbot` will fail with `not a git repository`. Update from a temporary clone instead:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git rsync
+
+rm -rf /tmp/bot_together
+git clone --depth 1 --branch main https://github.com/Libra1337/bot_together.git /tmp/bot_together
+
+sudo systemctl stop official-qqbot official-qqbot-api || true
+sudo cp -a /opt/official_qqbot /opt/official_qqbot.bak-$(date +%F-%H%M%S)
+
+sudo rsync -a --delete \
+  --exclude data \
+  --exclude .venv \
+  --exclude config.yaml \
+  --exclude logs \
+  /tmp/bot_together/official_qqbot/ /opt/official_qqbot/
+
+cd /opt/official_qqbot
+.venv/bin/python -m pip install -r requirements.txt
+if [ -d koishi-bridge ]; then
+  (cd koishi-bridge && npm install)
+fi
+
+sudo mkdir -p /etc/official-qqbot
+if [ ! -f /etc/official-qqbot/koishi-bridge.env ]; then
+  sudo cp deploy/ubuntu/koishi-bridge.env.example /etc/official-qqbot/koishi-bridge.env
+fi
+
+sudo cp deploy/ubuntu/official-qqbot.service /etc/systemd/system/
+sudo cp deploy/ubuntu/official-qqbot-api.service /etc/systemd/system/
+sudo cp deploy/ubuntu/koishi-bridge.service /etc/systemd/system/
+sudo cp deploy/ubuntu/nonebot-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart official-qqbot-api official-qqbot
+sudo systemctl status official-qqbot-api official-qqbot --no-pager
+```
+
 ## Cloud Control API
 
 The bot can keep users, roles, bans, email bindings, resource limits, usage, and logs in a database-backed control API.
