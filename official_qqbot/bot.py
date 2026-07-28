@@ -10,22 +10,30 @@ import json
 import asyncio
 import logging
 import re
+import random
 import time as _time_mod
 import yaml
 import httpx
 import websockets
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from difflib import SequenceMatcher
 from collections import OrderedDict
 
 # 共享冷却
 import shared_cooldown as _shared_cd
+from state_backend import LocalStateBackend, build_state_backend
 
+from adapters.qq_official import (
+    C2C_MESSAGE_CREATE,
+    GROUP_AT_MESSAGE_CREATE,
+    GROUP_MESSAGE_EVENTS,
+    adapt_message_event,
+)
+from adapters.koishi_bridge import adapt_koishi_payload
 from handlers.ai_chat import AIChat
 from handlers import nfa, sauth, bjd, hypban, web_crawler
 from handlers import fun, bilibili, douyin, music, github
 from handlers import email_sender
-from feature_flags import FeatureFlags
-from plugin_runtime import PluginRuntime
 
 # ====== 版本 ======
 BOT_VERSION = "1.1.0"
@@ -49,14 +57,81 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 BOT_CONFIG = config.get("bot", {})
 AI_CONFIG = config.get("ai", {})
 EMAIL_CONFIG = config.get("email", {})
-APP_ID = BOT_CONFIG["app_id"]
-APP_SECRET = BOT_CONFIG["app_secret"]
+BRIDGE_CONFIG = config.get("bridge", {})
+CONTROL_CONFIG = config.get("control_api", {})
+
+
+def _config_string_set(value) -> set[str]:
+    if isinstance(value, str):
+        value = value.split(",")
+    if not value:
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
+
+
+def _config_value(section: dict, key: str, env_name: str | None = None, default=None):
+    if env_name:
+        env_value = os.environ.get(env_name)
+        if env_value is not None and str(env_value).strip():
+            return str(env_value).strip()
+    return section.get(key, default)
+
+
+def _config_bool(
+    section: dict, key: str, env_name: str | None = None, default: bool = False
+) -> bool:
+    value = _config_value(section, key, env_name, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _full_message_group_ids(section: dict) -> set[str]:
+    return (
+        _config_string_set(section.get("full_message_group_ids", []))
+        | _config_string_set(section.get("non_at_group_whitelist", []))
+        | _config_string_set(os.environ.get("QQ_GROUP_WHITELIST", ""))
+    )
+
+
+APP_ID = _config_value(BOT_CONFIG, "app_id", "QQ_APP_ID")
+APP_SECRET = _config_value(BOT_CONFIG, "app_secret", "QQ_APP_SECRET")
 SANDBOX = BOT_CONFIG.get("sandbox", False)
 ADMIN_SECRET = config.get("admin_secret", "miracle2026")
 API_BASE = (
     "https://sandbox.api.sgroup.qq.com" if SANDBOX else "https://api.sgroup.qq.com"
 )
 AUTH_URL = "https://bots.qq.com/app/getAppAccessToken"
+FULL_MESSAGE_GROUP_IDS = _full_message_group_ids(BOT_CONFIG)
+GATEWAY_INTENTS = int(_config_value(BOT_CONFIG, "intents", "QQ_INTENTS", 1 << 25))
+OFFICIAL_WS_ENABLED = _config_bool(
+    BOT_CONFIG, "official_ws_enabled", "QQ_OFFICIAL_WS_ENABLED", True
+)
+BRIDGE_ENABLED = _config_bool(BRIDGE_CONFIG, "enabled", "QQ_BRIDGE_ENABLED", False)
+BRIDGE_HOST = str(BRIDGE_CONFIG.get("host", "127.0.0.1"))
+BRIDGE_PORT = int(BRIDGE_CONFIG.get("port", 8765))
+BRIDGE_TOKEN = str(BRIDGE_CONFIG.get("token", ""))
+MARKDOWN_ENABLED = _config_bool(
+    BOT_CONFIG, "markdown_enabled", "QQ_MARKDOWN_ENABLED", True
+)
+QQ_WEBHOOK_PATH = str(_config_value(BOT_CONFIG, "webhook_path", "QQ_WEBHOOK_PATH", "/qq") or "/qq")
+if not QQ_WEBHOOK_PATH.startswith("/"):
+    QQ_WEBHOOK_PATH = "/" + QQ_WEBHOOK_PATH
+CONTROL_API_BASE_URL = str(
+    _config_value(CONTROL_CONFIG, "base_url", "CONTROL_API_BASE_URL", "") or ""
+)
+BOT_CONTROL_TOKEN = str(
+    _config_value(CONTROL_CONFIG, "bot_token", "BOT_CONTROL_TOKEN", "") or ""
+)
+AI_BASE_URL = str(
+    _config_value(AI_CONFIG, "base_url", "AI_BASE_URL", "https://fisx-ai.guimc.ltd/v1")
+    or ""
+)
+AI_API_KEY = str(_config_value(AI_CONFIG, "api_key", "AI_API_KEY", "") or "")
+AI_MODEL = str(_config_value(AI_CONFIG, "model", "AI_MODEL", "grok-4.5") or "")
+AI_CONFIG["base_url"] = AI_BASE_URL
+AI_CONFIG["api_key"] = AI_API_KEY
+AI_CONFIG["model"] = AI_MODEL
 
 # ====== Admin/Staff/Ban 系统（openid） ======
 ADMIN_FILE = os.path.join(_BOT_DIR, "data", "admins.json")
@@ -114,15 +189,15 @@ _log.info(
 
 
 def _is_admin(user_openid: str) -> bool:
-    return user_openid in _admin_set
+    return _state_backend.is_admin(user_openid)
 
 
 def _is_admin_or_staff(user_openid: str) -> bool:
-    return user_openid in _admin_set or user_openid in _staff_logged_in
+    return _state_backend.is_admin_or_staff(user_openid)
 
 
 def _is_banned(user_openid: str) -> bool:
-    return user_openid in _banned_set
+    return _state_backend.is_banned(user_openid)
 
 
 # ====== 邮箱绑定 {openid: email} ======
@@ -150,6 +225,98 @@ def _save_email_binds():
 
 _email_binds: dict[str, str] = _load_email_binds()
 _log.info(f"[邮箱] 已加载 {len(_email_binds)} 个邮箱绑定")
+
+_state_backend = build_state_backend(CONTROL_API_BASE_URL, BOT_CONTROL_TOKEN)
+if isinstance(_state_backend, LocalStateBackend):
+    _state_backend.bind_memory(
+        admin_set=_admin_set,
+        staff=_staff,
+        staff_logged_in=_staff_logged_in,
+        banned_set=_banned_set,
+        email_binds=_email_binds,
+        save_admins=lambda: _save_json_set(ADMIN_FILE, _admin_set),
+        save_staff=_save_staff_dict,
+        save_banned=lambda: _save_json_set(BAN_FILE, _banned_set),
+        save_email_binds=_save_email_binds,
+    )
+_log.info(f"[State] backend={_state_backend.backend_name}")
+
+
+def _first_token(content: str) -> str:
+    parts = str(content or "").strip().split()
+    return parts[0].lower() if parts else ""
+
+
+def _record_seen_user(ctx: dict) -> None:
+    try:
+        _state_backend.seen_user(
+            ctx.get("user_openid", ""),
+            group_openid=ctx.get("group_openid", ""),
+        )
+    except AttributeError:
+        return
+    except Exception as e:
+        _log.warning(f"[ControlLog] seen_user failed: {e}")
+
+
+def _log_command_event(ctx: dict, content: str) -> None:
+    try:
+        _state_backend.log_command(
+            user_key=ctx.get("user_openid", ""),
+            group_openid=ctx.get("group_openid", ""),
+            command=_first_token(content),
+            content=str(content or ""),
+            message_id=ctx.get("msg_id", ""),
+        )
+    except AttributeError:
+        return
+    except Exception as e:
+        _log.warning(f"[ControlLog] command failed: {e}")
+
+
+def _log_outbound_event(
+    ctx: dict,
+    channel: str,
+    ok: bool,
+    content: str,
+    message_id: str | None = None,
+) -> None:
+    try:
+        _state_backend.log_outbound(
+            user_key=ctx.get("user_openid", ""),
+            group_openid=ctx.get("group_openid", ""),
+            channel=channel,
+            status="success" if ok else "failed",
+            content=str(content or ""),
+            message_id=message_id or ctx.get("msg_id", ""),
+        )
+    except AttributeError:
+        return
+    except Exception as e:
+        _log.warning(f"[ControlLog] outbound failed: {e}")
+
+
+def _log_email_outbound(
+    ctx: dict,
+    user_id: str,
+    ok: bool,
+    subject: str,
+    masked_addr: str,
+) -> None:
+    try:
+        _state_backend.log_outbound(
+            user_key=user_id,
+            group_openid=ctx.get("group_openid", ""),
+            channel="email",
+            status="success" if ok else "failed",
+            content=f"{subject} -> {masked_addr}",
+            message_id=ctx.get("msg_id", ""),
+        )
+    except AttributeError:
+        return
+    except Exception as e:
+        _log.warning(f"[ControlLog] email failed: {e}")
+
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -179,7 +346,7 @@ def _is_valid_email_addr(email: str) -> bool:
 
 
 def _get_bound_email(user_id: str) -> str:
-    return _email_binds.get(user_id, "").strip()
+    return _state_backend.get_email_binding(user_id)
 
 
 def _mask_email_addr(email: str) -> str:
@@ -210,16 +377,23 @@ async def _send_resource_result(
     resource_label: str,
     subject: str,
     result: str,
+    quota_text: str = "",
 ) -> bool:
     to_addr = _get_bound_email(user_id)
-    ok, err = await _send_result_email(to_addr, subject, result)
+    delivery_body = _append_quota_text(result, quota_text)
+    email_body = _append_full_ads_to_email(delivery_body)
+    ok, err = await _send_result_email(to_addr, subject, email_body)
     masked_addr = _mask_email_addr(to_addr)
+    _log_email_outbound(ctx, user_id, ok, subject, masked_addr)
     if ok:
-        await reply(ctx, f"{resource_label} 已发送到邮箱 {masked_addr}，请查收喵~")
+        reply_text = f"{resource_label} 已发送到邮箱 {masked_addr}，请查收喵~"
+        if quota_text.strip():
+            reply_text += f"\n{quota_text.strip()}"
+        await reply(ctx, reply_text)
         return True
 
     _log.warning(f"[{resource_key}] 邮件发送失败 -> {masked_addr}: {err}")
-    await reply(ctx, f"{resource_label} 邮件发送失败，已改为当前会话发送喵~\n{result}")
+    await reply(ctx, f"{resource_label} 邮件发送失败，已改为当前会话发送喵~\n{email_body}")
     return False
 
 
@@ -241,66 +415,15 @@ ai_chat = AIChat(
     max_history=AI_CONFIG.get("max_history", 10),
 )
 
-# ====== 插件运行时 ======
-feature_flags = FeatureFlags(os.path.join(_BOT_DIR, "data", "plugins.json"))
-plugin_runtime = PluginRuntime(
-    plugins_dir=os.path.join(_BOT_DIR, "plugins"),
-    state_file=os.path.join(_BOT_DIR, "data", "plugins.json"),
-    reply_func=reply if "reply" in globals() else None,
-)
-
-
-def _feature_enabled(feature_id: str) -> bool:
-    return feature_flags.enabled(feature_id)
-
-
-async def _reply_feature_disabled(ctx, label: str) -> bool:
-    await reply(ctx, f"{label} 功能已在面板停用喵~")
-    return True
-
-
-def _disabled_builtin_for_command(lower: str, content: str) -> tuple[str, str] | None:
-    bind_like = lower in (
-        "/bind",
-        "bind",
-        "绑定邮箱",
-        "/绑定邮箱",
-        "绑邮箱",
-        "/unbind",
-        "unbind",
-        "解绑邮箱",
-        "/解绑邮箱",
-        "取消邮箱",
-    ) or bool(re.match(r"^(?:/bind|绑定邮箱|/绑定邮箱)\s+", content, re.IGNORECASE))
-    checks = [
-        (
-            "builtin.admin",
-            "Bot 管理指令",
-            lower in ("/auth", "auth", "/quit", "quit", "/admin", "admin")
-            or content.startswith(("/auth ", "auth ", "/ban ", "/unban ", "/addstaff ", "/deletestaff "))
-            or bool(re.match(r"^/ad(s?\+|s?-|)\s*(.*)", content or "", re.DOTALL)),
-        ),
-        ("builtin.stock", "库存/邮箱", bind_like or lower in ("163", "/163", "stock", "/stock")),
-        ("builtin.fun", "日常娱乐", lower in ("签到", "打卡", "运势", "今日运势", "抽签", "每日运势", "今日人品", "人品", "jrrp", "排行榜", "积分榜", "签到排行")),
-        ("builtin.ai_chat", "AI 对话", lower in ("清除记忆", "重置记忆", "清空记忆", "重置对话", "清空对话")),
-        ("builtin.nfa", "NFA", lower in ("nfa", "/nfa")),
-        ("builtin.sauth", "4399 Sauth", lower in ("4399", "/4399")),
-        ("builtin.bjd", "布吉岛查询", lower in ("bjd", "/bjd", "布吉岛")),
-        ("builtin.hypban", "Hypixel 封禁", lower in ("hypban", "/hypban")),
-        ("builtin.music", "点歌", bool(re.match(r"^(点歌|听歌|来首歌)(\s+.*)?$", content))),
-        ("builtin.github", "GitHub 搜索", bool(re.match(r"^(搜索github|github搜|搜索gh)\s+(.+)", content, re.IGNORECASE))),
-    ]
-    for feature_id, label, matched in checks:
-        if matched and not _feature_enabled(feature_id):
-            return feature_id, label
-    return None
-
 # ====== 冷却/频率常量 ======
 NFA_COOLDOWN = 1800
 _NFA_HOUR_LIMIT = 5
 _NFA_BAN_DURATION = 86400
 _163_HOUR_LIMIT = 5
 _163_BAN_DURATION = 86400
+
+_RESTRICT_FEATURES = {"163", "4399", "nfa"}
+_RESTRICT_UNITS = {"min", "hour", "day", "month", "quarter", "year"}
 
 # ====== 交互状态 ======
 # 点歌等待 {user_openid: {"ts": timestamp, "ctx": ctx}}
@@ -313,6 +436,85 @@ _github_select: dict[str, dict] = {}
 _fuzzy_waiting: dict[str, dict] = {}
 # /ad 查看状态 {user_openid: expire_timestamp}
 _ad_waiting: dict[str, float] = {}
+
+
+def _parse_restrict_command(content: str) -> tuple[str, int, str] | None:
+    parts = content.strip().split()
+    if len(parts) != 4 or parts[0].lower() != "/restrict":
+        return None
+    feature = parts[1].lower()
+    unit = parts[3].lower()
+    if feature not in _RESTRICT_FEATURES or unit not in _RESTRICT_UNITS:
+        return None
+    try:
+        limit = int(parts[2])
+    except ValueError:
+        return None
+    if limit <= 0:
+        return None
+    return feature, limit, unit
+
+
+def _format_duration_cn(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds <= 0:
+        return "0s"
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if hours or minutes:
+        parts.append(f"{minutes}min")
+    parts.append(f"{seconds}s")
+    return "".join(parts)
+
+
+def _resource_quota_line(status: dict) -> str:
+    limit = int(status.get("limit", 0) or 0)
+    if limit <= 0:
+        return ""
+    count = int(status.get("count", 0) or 0)
+    return f"当前获取：{count}/{limit}"
+
+
+def _resource_quota_text(status: dict, include_reset: bool = False) -> str:
+    lines = []
+    quota_line = _resource_quota_line(status)
+    if quota_line:
+        lines.append(quota_line)
+    reset_after = int(status.get("reset_after", 0) or 0)
+    if include_reset and reset_after:
+        lines.append(f"限额刷新：{_format_duration_cn(reset_after)}")
+    return "\n".join(lines)
+
+
+def _append_quota_text(body: str, quota_text: str = "") -> str:
+    quota_text = str(quota_text or "").strip()
+    if not quota_text:
+        return body
+    return body.rstrip() + "\n\n" + quota_text
+
+
+async def _check_resource_restrict(ctx: dict, feature: str, user_id: str) -> dict | None:
+    status = _state_backend.get_resource_limit_status(feature, user_id)
+    if status.get("blocked"):
+        quota_text = _resource_quota_text(status, include_reset=True)
+        lines = ["已达到获取上限"]
+        if quota_text:
+            lines.append(quota_text)
+        await reply(ctx, "\n".join(lines))
+        return None
+    return status
+
+
+def _record_resource_restrict(feature: str, user_id: str) -> None:
+    _state_backend.record_resource_usage(feature, user_id)
+
+
+def _resource_success_quota_line(feature: str, user_id: str) -> str:
+    status = _state_backend.get_resource_limit_status(feature, user_id)
+    return _resource_quota_text(status, include_reset=True)
 
 # ====== 模糊指令 ======
 _KNOWN_COMMANDS = {
@@ -437,17 +639,42 @@ if not os.path.exists(ADS_FILE):
     _save_ads()
 
 
+def _refresh_ads_from_file():
+    global _ads
+    _ads = _load_ads()
+    changed = _expire_ads_in_place(_ads)
+    if changed:
+        _save_ads()
+    return _ads
+
+
+def _expire_ads_in_place(ads: list[dict]) -> bool:
+    now = _time_mod.time()
+    changed = False
+    for ad in ads:
+        until = ad.get("active_until")
+        if ad.get("enabled") and isinstance(until, (int, float)) and until <= now:
+            ad["enabled"] = False
+            changed = True
+    return changed
+
+
 def _get_active_ads():
+    _refresh_ads_from_file()
     now = _time_mod.time()
     result = []
+    changed = False
     for ad in _ads:
         if not ad.get("enabled"):
             continue
         until = ad.get("active_until")
         if isinstance(until, (int, float)) and until <= now:
             ad["enabled"] = False
+            changed = True
             continue
         result.append(ad.get("content", ""))
+    if changed:
+        _save_ads()
     return result
 
 
@@ -455,7 +682,18 @@ def _append_ads(text):
     ads = _get_active_ads()
     if not ads:
         return text
-    return f"{text}\n\n━━━ 广告 ━━━\n" + "\n".join(ads)
+    ad = random.choice(ads)
+    return f"{text}\n\n━━━ 广告 ━━━\n{ad}"
+
+
+def _append_full_ads_to_email(body: str) -> str:
+    ads = _get_active_ads()
+    if not ads:
+        return body
+    lines = ["", "━━━━━━━━━━━━━━", "完整赞助信息"]
+    for index, ad in enumerate(ads, start=1):
+        lines.append(f"{index}. {ad}")
+    return body.rstrip() + "\n\n" + "\n".join(lines)
 
 
 # ====== 签到系统（openid） ======
@@ -524,7 +762,13 @@ async def refresh_access_token():
             AUTH_URL, json={"appId": APP_ID, "clientSecret": APP_SECRET}
         )
         data = resp.json()
-        _access_token = data["access_token"]
+        token = data.get("access_token")
+        if not token:
+            body = json.dumps(data, ensure_ascii=False)[:500]
+            raise RuntimeError(
+                f"Auth response missing access_token: status={resp.status_code} body={body}"
+            )
+        _access_token = token
         expires_in = int(data.get("expires_in", 7200))
         _token_expire_at = _time_mod.time() + expires_in - 60
         _log.info(f"[Auth] access_token 有效期 {expires_in}s")
@@ -533,8 +777,21 @@ async def refresh_access_token():
 async def get_auth_header():
     if _time_mod.time() >= _token_expire_at:
         await refresh_access_token()
+    return _build_bot_auth_header()
+
+
+def _build_bot_auth_header():
     return {
         "Authorization": f"QQBot {_access_token}",
+        "X-Union-Appid": APP_ID,
+        "Content-Type": "application/json",
+    }
+
+
+def _build_gateway_auth_header():
+    return {
+        "Authorization": f"Bearer {_access_token}",
+        "X-Union-Appid": APP_ID,
         "Content-Type": "application/json",
     }
 
@@ -542,14 +799,27 @@ async def get_auth_header():
 async def get_gateway_auth_header():
     if _time_mod.time() >= _token_expire_at:
         await refresh_access_token()
-    return {
-        "Authorization": f"Bearer {_access_token}",
-        "Content-Type": "application/json",
-    }
+    return _build_gateway_auth_header()
 
 
 # ====== 消息发送 ======
 _msg_seq_counter: dict[str, int] = {}
+_INBOUND_GROUP_MSG_CACHE_MAX = 1000
+_recent_group_msg_ids: OrderedDict[str, float] = OrderedDict()
+
+
+def _remember_group_message(group_openid: str, msg_id: str) -> bool:
+    if not msg_id:
+        return True
+
+    key = f"{group_openid}:{msg_id}"
+    if key in _recent_group_msg_ids:
+        return False
+
+    _recent_group_msg_ids[key] = _time_mod.time()
+    while len(_recent_group_msg_ids) > _INBOUND_GROUP_MSG_CACHE_MAX:
+        _recent_group_msg_ids.popitem(last=False)
+    return True
 
 
 # QQ 官方 API 禁止消息包含 URL 域名，需要脱敏
@@ -586,64 +856,201 @@ def _sanitize_url(text: str) -> str:
     return result
 
 
-async def send_group_msg(group_openid, content, msg_id):
-    content = _sanitize_url(_append_ads(content))
+def _next_msg_seq(key: str) -> int:
+    _msg_seq_counter[key] = _msg_seq_counter.get(key, 0) + 1
+    return _msg_seq_counter[key]
+
+
+def _build_text_payload(content: str, msg_id: str, msg_seq: int) -> dict:
+    return {
+        "content": content,
+        "msg_type": 0,
+        "msg_id": msg_id,
+        "msg_seq": msg_seq,
+    }
+
+
+def _build_markdown_payload(
+    content: str, msg_id: str, msg_seq: int, keyboard: dict | None = None
+) -> dict:
+    payload = {
+        "msg_type": 2,
+        "markdown": {"content": content},
+        "msg_id": msg_id,
+        "msg_seq": msg_seq,
+    }
+    if keyboard:
+        payload["keyboard"] = keyboard
+    return payload
+
+
+def _build_send_payload(
+    content: str,
+    msg_id: str,
+    msg_seq: int,
+    markdown: bool,
+    keyboard: dict | None = None,
+) -> dict:
+    if markdown and MARKDOWN_ENABLED:
+        return _build_markdown_payload(content, msg_id, msg_seq, keyboard)
+    return _build_text_payload(content, msg_id, msg_seq)
+
+
+def _command_button(
+    button_id: str,
+    label: str,
+    command: str,
+    style: int = 1,
+) -> dict:
+    return {
+        "id": button_id,
+        "render_data": {
+            "label": label,
+            "visited_label": label,
+            "style": style,
+        },
+        "action": {
+            "type": 2,
+            "data": command,
+            "enter": True,
+            "reply": False,
+            "permission": {"type": 2},
+        },
+    }
+
+
+def _default_resource_keyboard() -> dict:
+    return _build_inline_keyboard(
+        [
+            [
+                _command_button("quick_4399", "获取4399", "/4399", 1),
+                _command_button("quick_163", "获取163", "/163", 1),
+            ],
+            [
+                _command_button("quick_stock", "查询库存", "/查库存", 1),
+                _command_button("quick_bind", "快捷绑定", "/bind", 1),
+            ]
+        ]
+    )
+
+
+def _build_inline_keyboard(rows: list[list[dict]]) -> dict:
+    return {
+        "content": {
+            "rows": [{"buttons": row[:5]} for row in rows[:5] if row],
+        }
+    }
+
+
+def _status_ok(status_code: int) -> bool:
+    return status_code in (200, 201, 202, 204)
+
+
+async def _post_with_markdown_fallback(
+    client,
+    url: str,
+    headers: dict,
+    key: str,
+    content: str,
+    msg_id: str,
+    log_prefix: str,
+    keyboard: dict | None = None,
+) -> bool:
+    body = _build_send_payload(
+        content, msg_id, _next_msg_seq(key), markdown=True, keyboard=keyboard
+    )
+    resp = await client.post(url, headers=headers, json=body)
+    if _status_ok(resp.status_code):
+        return True
+
+    if MARKDOWN_ENABLED and body.get("msg_type") == 2:
+        _log.warning(
+            f"{log_prefix} Markdown失败 {resp.status_code}: {resp.text[:200]}，降级文本"
+        )
+        fallback_body = _build_send_payload(
+            content, msg_id, _next_msg_seq(key), markdown=False
+        )
+        resp = await client.post(url, headers=headers, json=fallback_body)
+        if _status_ok(resp.status_code):
+            return True
+
+    _log.warning(f"{log_prefix} 失败 {resp.status_code}: {resp.text[:200]}")
+    return False
+
+
+async def send_group_msg(group_openid, content, msg_id, keyboard: dict | None = None):
+    content = _sanitize_url(content)
     if len(content) > 2000:
         content = content[:2000] + "\n...(内容过长已截断)"
+    if keyboard is None:
+        keyboard = _default_resource_keyboard()
     headers = await get_auth_header()
     key = f"g_{group_openid}_{msg_id}"
-    _msg_seq_counter[key] = _msg_seq_counter.get(key, 0) + 1
-    body = {
-        "content": content,
-        "msg_type": 0,
-        "msg_id": msg_id,
-        "msg_seq": _msg_seq_counter[key],
-    }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
+            return await _post_with_markdown_fallback(
+                client,
                 f"{API_BASE}/v2/groups/{group_openid}/messages",
-                headers=headers,
-                json=body,
+                headers,
+                key,
+                content,
+                msg_id,
+                "[发送] 群消息",
+                keyboard,
             )
-            if resp.status_code not in (200, 201, 202, 204):
-                _log.warning(f"[发送] 群消息失败 {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         _log.error(f"[发送] 群消息异常: {e}")
+        return False
 
 
-async def send_c2c_msg(user_openid, content, msg_id):
-    content = _sanitize_url(_append_ads(content))
+async def send_c2c_msg(user_openid, content, msg_id, keyboard: dict | None = None):
+    content = _sanitize_url(content)
     if len(content) > 2000:
         content = content[:2000] + "\n...(内容过长已截断)"
+    if keyboard is None:
+        keyboard = _default_resource_keyboard()
     headers = await get_auth_header()
     key = f"c_{user_openid}_{msg_id}"
-    _msg_seq_counter[key] = _msg_seq_counter.get(key, 0) + 1
-    body = {
-        "content": content,
-        "msg_type": 0,
-        "msg_id": msg_id,
-        "msg_seq": _msg_seq_counter[key],
-    }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
+            return await _post_with_markdown_fallback(
+                client,
                 f"{API_BASE}/v2/users/{user_openid}/messages",
-                headers=headers,
-                json=body,
+                headers,
+                key,
+                content,
+                msg_id,
+                "[发送] 私聊",
+                keyboard,
             )
-            if resp.status_code not in (200, 201, 202, 204):
-                _log.warning(f"[发送] 私聊失败 {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         _log.error(f"[发送] 私聊异常: {e}")
+        return False
 
 
 # ====== 统一回复 ======
 async def reply(ctx, text):
     if ctx["type"] == "group":
-        await send_group_msg(ctx["group_openid"], text, ctx["msg_id"])
+        ok = await send_group_msg(ctx["group_openid"], text, ctx["msg_id"])
+        _log_outbound_event(ctx, "group", ok, text)
     else:
-        await send_c2c_msg(ctx["user_openid"], text, ctx["msg_id"])
+        ok = await send_c2c_msg(ctx["user_openid"], text, ctx["msg_id"])
+        _log_outbound_event(ctx, "c2c", ok, text)
+
+
+async def reply_markdown_card(ctx, markdown: str, button_rows: list[list[dict]]):
+    keyboard = _build_inline_keyboard(button_rows)
+    if ctx["type"] == "group":
+        ok = await send_group_msg(
+            ctx["group_openid"], markdown, ctx["msg_id"], keyboard=keyboard
+        )
+        _log_outbound_event(ctx, "group", ok, markdown)
+    else:
+        ok = await send_c2c_msg(
+            ctx["user_openid"], markdown, ctx["msg_id"], keyboard=keyboard
+        )
+        _log_outbound_event(ctx, "c2c", ok, markdown)
+    return ok
 
 
 async def reply_plain(ctx, text):
@@ -660,23 +1067,23 @@ async def reply_plain(ctx, text):
         url = f"{API_BASE}/v2/users/{ctx['user_openid']}/messages"
         key = f"c_{ctx['user_openid']}_{ctx['msg_id']}"
 
-    _msg_seq_counter[key] = _msg_seq_counter.get(key, 0) + 1
-    body = {
-        "content": text,
-        "msg_type": 0,
-        "msg_id": ctx["msg_id"],
-        "msg_seq": _msg_seq_counter[key],
-    }
+    ok = False
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, headers=headers, json=body)
-            if resp.status_code not in (200, 201, 202, 204):
-                _log.warning(f"[发送plain] {resp.status_code}: {resp.text[:300]}")
+            ok = await _post_with_markdown_fallback(
+                client,
+                url,
+                headers,
+                key,
+                text,
+                ctx["msg_id"],
+                "[发送plain]",
+            )
     except Exception as e:
         _log.error(f"[发送plain] 异常: {e}")
-
-
-plugin_runtime.reply_func = reply
+    finally:
+        _log_outbound_event(ctx, "group" if ctx["type"] == "group" else "c2c", ok, text)
+    return ok
 
 
 # ====== 指令处理 ======
@@ -684,6 +1091,27 @@ async def handle_command(ctx, content):
     """处理所有指令，返回 True 表示已处理"""
     lower = content.lower().strip()
     user_id = ctx["user_openid"]
+    limit_user_id = ctx.get("limit_user_id") or user_id
+
+    if lower in ("/mdtest", "mdtest"):
+        await reply_markdown_card(
+            ctx,
+            (
+                "## Markdown 测试\n\n"
+                "服务：**Official QQBot**\n"
+                "这是一条 Markdown 卡片测试消息。\n"
+                f"ID:{ctx.get('msg_id', '')}\n\n"
+                "> 如果下方按钮能显示，说明 keyboard 也生效。"
+            ),
+            [
+                [
+                    _command_button("mdtest_status", "查看状态", "/status", 1),
+                    _command_button("mdtest_stock", "查看库存", "/stock", 1),
+                    _command_button("mdtest_help", "帮助", "/help", 1),
+                ]
+            ],
+        )
+        return True
 
     # 帮助
     if lower in ("/help", "help", "帮助", "菜单"):
@@ -740,10 +1168,6 @@ async def handle_command(ctx, content):
         )
         return True
 
-    disabled = _disabled_builtin_for_command(lower, content)
-    if disabled:
-        return await _reply_feature_disabled(ctx, disabled[1])
-
     # ===== 封禁检测 =====
     if _is_banned(user_id):
         await reply_plain(ctx, "您已被封禁，无法使用 Bot 喵~")
@@ -765,8 +1189,7 @@ async def handle_command(ctx, content):
 
         # admin 验证
         if code == ADMIN_SECRET:
-            _admin_set.add(user_id)
-            _save_json_set(ADMIN_FILE, _admin_set)
+            _state_backend.add_admin(user_id)
             await reply_plain(
                 ctx, "验证成功喵~您已成为管理员！\n授权已持久化，重启后无需重新验证~"
             )
@@ -774,19 +1197,18 @@ async def handle_command(ctx, content):
             return True
 
         # staff 密码验证
-        if user_id in _staff:
-            staff_info = _staff[user_id]
-            if not staff_info.get("password"):
-                staff_info["password"] = code
-                _save_staff_dict()
-                _staff_logged_in.add(user_id)
+        if _state_backend.staff_exists(user_id):
+            staff_password = _state_backend.get_staff_password(user_id)
+            if not staff_password:
+                _state_backend.set_staff_password(user_id, code)
+                _state_backend.login_staff(user_id)
                 await reply_plain(
                     ctx, f"Staff 密码设置成功喵~已登陆！\n（密码：{code}）"
                 )
                 _log.info(f"[Staff] {user_id[:8]}... 激活")
                 return True
-            if staff_info.get("password") == code:
-                _staff_logged_in.add(user_id)
+            if staff_password == code:
+                _state_backend.login_staff(user_id)
                 await reply_plain(ctx, "Staff 登陆成功喵~")
                 _log.info(f"[Staff] {user_id[:8]}... 登陆")
                 return True
@@ -796,14 +1218,7 @@ async def handle_command(ctx, content):
 
     # ===== /quit =====
     if lower in ("/quit", "quit"):
-        removed = False
-        if user_id in _admin_set:
-            _admin_set.discard(user_id)
-            _save_json_set(ADMIN_FILE, _admin_set)
-            removed = True
-        if user_id in _staff_logged_in:
-            _staff_logged_in.discard(user_id)
-            removed = True
+        removed = _state_backend.logout(user_id)
         await reply_plain(ctx, "已退出登陆喵~" if removed else "您当前没有登陆状态喵~")
         return True
 
@@ -812,14 +1227,15 @@ async def handle_command(ctx, content):
         if not _is_admin(user_id):
             await reply(ctx, "需要管理权限喵~请先私聊 /auth 验证码")
             return True
-        admin_count = len(_admin_set)
-        staff_count = len(_staff)
-        ban_count = len(_banned_set)
+        counts = _state_backend.counts()
+        admin_count = counts["admins"]
+        staff_count = counts["staff"]
+        ban_count = counts["banned"]
         lines = [
             f"曦曦官方Bot 管理面板",
             f"━━━━━━━━━━━━━━",
             f"管理员：{admin_count} 人",
-            f"Staff：{staff_count} 人（在线 {len(_staff_logged_in)}）",
+            f"Staff：{staff_count} 人（在线 {counts['staff_online']}）",
             f"封禁：{ban_count} 人",
             f"━━━━━━━━━━━━━━",
             f"可用指令：",
@@ -832,6 +1248,30 @@ async def handle_command(ctx, content):
         await reply_plain(ctx, "\n".join(lines))
         return True
 
+    if lower.startswith("/restrict"):
+        if not _is_admin_or_staff(user_id):
+            await reply(ctx, "需要管理权限喵~")
+            return True
+        parsed = _parse_restrict_command(content)
+        if not parsed:
+            await reply(
+                ctx,
+                "用法：/restrict 163/4399/nfa 数量 时间\n时间支持：min hour day month quarter year",
+            )
+            return True
+        feature, limit, unit = parsed
+        _state_backend.set_resource_limit(feature, limit, unit, updated_by=user_id)
+        await reply_plain(ctx, f"已设置 {feature} 每个用户 {unit} 内最多获取 {limit} 个")
+        return True
+
+    if lower == "/resetlimit":
+        if not _is_admin_or_staff(user_id):
+            await reply(ctx, "需要管理权限喵~")
+            return True
+        _state_backend.reset_resource_usage()
+        await reply_plain(ctx, "已重置所有用户的获取限制记录，/restrict 规则保持不变")
+        return True
+
     # ===== /ban =====
     if content.startswith("/ban "):
         if not _is_admin_or_staff(user_id):
@@ -841,8 +1281,7 @@ async def handle_command(ctx, content):
         if not target:
             await reply(ctx, "用法：/ban openid")
             return True
-        _banned_set.add(target)
-        _save_json_set(BAN_FILE, _banned_set)
+        _state_backend.ban_user(target)
         await reply_plain(ctx, f"已封禁 {target[:12]}... 喵~")
         _log.info(f"[Ban] {user_id[:8]}... 封禁了 {target[:12]}...")
         return True
@@ -853,11 +1292,10 @@ async def handle_command(ctx, content):
             await reply(ctx, "需要管理权限喵~")
             return True
         target = content[7:].strip()
-        if target not in _banned_set:
+        if not _state_backend.is_banned(target):
             await reply(ctx, "该用户不在封禁列表中喵~")
             return True
-        _banned_set.discard(target)
-        _save_json_set(BAN_FILE, _banned_set)
+        _state_backend.unban_user(target)
         await reply_plain(ctx, f"已解封 {target[:12]}... 喵~")
         _log.info(f"[Unban] {user_id[:8]}... 解封了 {target[:12]}...")
         return True
@@ -871,11 +1309,10 @@ async def handle_command(ctx, content):
         if not target:
             await reply(ctx, "用法：/addstaff openid")
             return True
-        if target in _staff:
+        if _state_backend.staff_exists(target):
             await reply(ctx, "该用户已是 Staff 喵~")
             return True
-        _staff[target] = {"password": "", "added_by": user_id[:12]}
-        _save_staff_dict()
+        _state_backend.add_staff(target, added_by=user_id[:12])
         await reply_plain(
             ctx, f"已添加 Staff {target[:12]}... 喵~\n对方需私聊 /auth 密码 激活"
         )
@@ -888,19 +1325,17 @@ async def handle_command(ctx, content):
             await reply(ctx, "仅 Admin 可移除 Staff 喵~")
             return True
         target = content[13:].strip()
-        if target not in _staff:
+        if not _state_backend.staff_exists(target):
             await reply(ctx, "该用户不是 Staff 喵~")
             return True
-        del _staff[target]
-        _staff_logged_in.discard(target)
-        _save_staff_dict()
+        _state_backend.delete_staff(target)
         await reply_plain(ctx, f"已移除 Staff {target[:12]}... 喵~")
         _log.info(f"[Staff] {user_id[:8]}... 移除了 {target[:12]}...")
         return True
 
     # ===== /whois 查看用户 openid =====
     if lower in ("/whois", "whois"):
-        email = _email_binds.get(user_id, "未绑定")
+        email = _state_backend.get_email_binding(user_id) or "未绑定"
         await reply_plain(ctx, f"你的 openid：\n{user_id}\n绑定邮箱：{email}")
         return True
 
@@ -914,8 +1349,7 @@ async def handle_command(ctx, content):
                 "邮箱格式不对喵~请输入：/bind 你的邮箱地址\n例如：/bind 123456@qq.com",
             )
             return True
-        _email_binds[user_id] = email
-        _save_email_binds()
+        _state_backend.set_email_binding(user_id, email)
         await reply_plain(
             ctx, f"邮箱绑定成功喵~\n{email}\n之后领取 nfa/4399/163 会自动发到这个邮箱！"
         )
@@ -933,9 +1367,7 @@ async def handle_command(ctx, content):
 
     # ===== 解绑邮箱 =====
     if lower in ("/unbind", "unbind", "解绑邮箱", "/解绑邮箱", "取消邮箱"):
-        if user_id in _email_binds:
-            del _email_binds[user_id]
-            _save_email_binds()
+        if _state_backend.delete_email_binding(user_id):
             await reply_plain(ctx, "已解绑邮箱喵~之后需要重新绑定邮箱才能领取资源。")
         else:
             await reply(ctx, "你还没有绑定邮箱喵~")
@@ -970,33 +1402,43 @@ async def handle_command(ctx, content):
     if lower in ("nfa", "/nfa"):
         if not await _require_bound_email(ctx, user_id):
             return True
+        if not await _check_resource_restrict(ctx, "nfa", limit_user_id):
+            return True
 
-        banned, bh, bm = _shared_cd.is_banned("nfa", user_id)
+        banned, bh, bm = _shared_cd.is_banned("nfa", limit_user_id)
         if banned:
             await reply(
                 ctx, f"您因疑似偷卡已被临时封禁，剩余 {bh}小时{bm}分钟 后解封喵~"
             )
             return True
-        in_cd, remain = _shared_cd.check_cooldown("nfa", user_id, NFA_COOLDOWN)
+        in_cd, remain = _shared_cd.check_cooldown("nfa", limit_user_id, NFA_COOLDOWN)
         if in_cd:
             await reply(
                 ctx, f"获取太频繁啦喵~请 {remain // 60}分{remain % 60}秒 后再试~"
             )
             return True
         over, count = _shared_cd.check_hour_limit(
-            "nfa", user_id, _NFA_HOUR_LIMIT, _NFA_BAN_DURATION
+            "nfa", limit_user_id, _NFA_HOUR_LIMIT, _NFA_BAN_DURATION
         )
         if over:
             await reply(
                 ctx, f"一小时内频繁获取NFA（{count}次），疑似偷卡，已封禁24小时喵~"
             )
             return True
-        _shared_cd.record_usage("nfa", user_id)
+        _shared_cd.record_usage("nfa", limit_user_id)
         result = await nfa.get_nfa_token("admin", "zutomayo0.")
         if "主人您的nfa来了喵" in result:
+            _record_resource_restrict("nfa", limit_user_id)
+            quota_text = _resource_success_quota_line("nfa", limit_user_id)
             result += "\n爱来自Miracle nfa bot喵~"
             await _send_resource_result(
-                ctx, user_id, "NFA", "NFA", "Miracle NFA Token", result
+                ctx,
+                user_id,
+                "NFA",
+                "NFA",
+                "Miracle NFA Token",
+                result,
+                quota_text=quota_text,
             )
         else:
             await reply(ctx, result)
@@ -1007,12 +1449,22 @@ async def handle_command(ctx, content):
     if lower in ("4399", "/4399"):
         if not await _require_bound_email(ctx, user_id):
             return True
+        if not await _check_resource_restrict(ctx, "4399", limit_user_id):
+            return True
 
         success, result = await sauth.get_sauth()
         if success:
+            _record_resource_restrict("4399", limit_user_id)
+            quota_text = _resource_success_quota_line("4399", limit_user_id)
             result += "\n爱来自Miracle小号网站喵~"
             await _send_resource_result(
-                ctx, user_id, "4399", "4399 Sauth", "Miracle 4399 Sauth", result
+                ctx,
+                user_id,
+                "4399",
+                "4399 Sauth",
+                "Miracle 4399 Sauth",
+                result,
+                quota_text=quota_text,
             )
         else:
             await reply(ctx, result)
@@ -1023,68 +1475,48 @@ async def handle_command(ctx, content):
     if lower in ("163", "/163"):
         if not await _require_bound_email(ctx, user_id):
             return True
+        if not await _check_resource_restrict(ctx, "163", limit_user_id):
+            return True
 
-        banned, bh, bm = _shared_cd.is_banned("163", user_id)
+        banned, bh, bm = _shared_cd.is_banned("163", limit_user_id)
         if banned:
             await reply(
                 ctx, f"您因疑似偷卡已被临时封禁，剩余 {bh}小时{bm}分钟 后解封喵~"
             )
             return True
-        in_cd, remain = _shared_cd.check_cooldown("163", user_id, 60)
+        in_cd, remain = _shared_cd.check_cooldown("163", limit_user_id, 60)
         if in_cd:
             await reply(ctx, f"一分钟内已获取过啦，请{remain}秒后再试喵~")
             return True
         over, count = _shared_cd.check_hour_limit(
-            "163", user_id, _163_HOUR_LIMIT, _163_BAN_DURATION
+            "163", limit_user_id, _163_HOUR_LIMIT, _163_BAN_DURATION
         )
         if over:
             await reply(
                 ctx, f"一小时内频繁获取（{count}次），疑似偷卡，已封禁24小时喵~"
             )
             return True
-        _shared_cd.record_usage("163", user_id)
+        _shared_cd.record_usage("163", limit_user_id)
 
-        accounts_file = os.path.join(_BOT_DIR, "data", "163accounts.txt")
-        try:
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            valid = [
-                l
-                for l in lines
-                if l.strip() and not l.strip().startswith("#") and "----" in l
-            ]
-            other = [l for l in lines if l not in valid]
-            if not valid:
-                await reply(ctx, "163小号暂时没有库存了喵~")
-                return True
-            parts = valid[0].strip().split("----", 1)
-            account, password = (
-                parts[0].strip(),
-                (parts[1].strip() if len(parts) > 1 else "未知"),
-            )
-            with open(accounts_file, "w", encoding="utf-8") as f:
-                f.writelines(other + valid[1:])
-            result_163 = (
-                f"主人您的163小号来了喵~\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"账号：{account}\n"
-                f"密码：{password}\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"可能需要手机验证，需要主人自己过验证哦~\n"
-                f"爱来自Miracle小号网~"
-            )
+        success, result_163 = await sauth.get_163_credentials()
+        if success:
+            _record_resource_restrict("163", limit_user_id)
+            quota_text = _resource_success_quota_line("163", limit_user_id)
             await _send_resource_result(
-                ctx, user_id, "163", "163 小号", "Miracle 163 小号", result_163
+                ctx,
+                user_id,
+                "163",
+                "163 小号",
+                "Miracle 163 小号",
+                result_163,
+                quota_text=quota_text,
             )
-        except FileNotFoundError:
-            await reply(ctx, "163小号文件不存在喵~")
-        except Exception as e:
-            _log.error(f"[163] {e}")
-            await reply(ctx, "163获取出错了喵~")
+        else:
+            await reply(ctx, result_163)
         return True
 
     # stock
-    if lower in ("stock", "/stock"):
+    if lower in ("stock", "/stock", "查库存", "/查库存"):
         lines = ["Miracle Bot 库存总览喵~", "━━━━━━━━━━━━━━"]
         try:
             ok, count, _ = await nfa.get_nfa_stock()
@@ -1097,14 +1529,10 @@ async def handle_command(ctx, content):
         except Exception:
             lines.append("4399：unavailable")
         try:
-            af = os.path.join(_BOT_DIR, "data", "163accounts.txt")
-            with open(af, "r", encoding="utf-8") as f:
-                c163 = sum(
-                    1
-                    for l in f
-                    if l.strip() and not l.strip().startswith("#") and "----" in l
-                )
-            lines.append(f"163：{c163}")
+            ok163, avail163, total163, used163, _ = await sauth.get_163_stock()
+            lines.append(
+                f"163：{avail163}/{total163}" if ok163 else "163：unavailable"
+            )
         except Exception:
             lines.append("163：unavailable")
         lines.append("━━━━━━━━━━━━━━")
@@ -1234,6 +1662,7 @@ async def handle_command(ctx, content):
     if ad_match:
         from datetime import datetime
 
+        _refresh_ads_from_file()
         action = ad_match.group(1)
         payload = ad_match.group(2).strip()
 
@@ -1352,24 +1781,12 @@ async def handle_command(ctx, content):
     return False
 
 
-async def handle_plugin(ctx, content):
-    """Run enabled plugins after built-in commands and before AI fallback."""
-    result = await plugin_runtime.dispatch({"ctx": ctx, "content": content})
-    if not result:
-        return False
-
-    reply_text = result.get("reply")
-    if reply_text:
-        await reply(ctx, str(reply_text))
-    return True
-
-
 # ====== 链接解析 ======
 async def check_links(ctx, content):
     """检查消息中的 B站/抖音/网页链接"""
     # 抖音
     dy_url = douyin.extract_douyin_url(content)
-    if dy_url and _feature_enabled("builtin.douyin"):
+    if dy_url:
         info = await douyin.get_video_info(dy_url)
         if info:
             await reply(ctx, info.get("text", "解析失败"))
@@ -1377,7 +1794,7 @@ async def check_links(ctx, content):
 
     # B站
     bili_id = bilibili.extract_bilibili_id(content)
-    if bili_id and _feature_enabled("builtin.bilibili"):
+    if bili_id:
         info = await bilibili.get_video_info(bili_id)
         if info:
             await reply(ctx, info.get("text", "解析失败"))
@@ -1385,7 +1802,7 @@ async def check_links(ctx, content):
 
     # 网页链接
     url = web_crawler.extract_url(content)
-    if url and _feature_enabled("builtin.web_crawler"):
+    if url:
         await reply(ctx, f"检测到链接，正在分析喵...\n{url}")
         try:
             ok, html = await web_crawler.fetch_page(url)
@@ -1411,8 +1828,6 @@ async def check_links(ctx, content):
 
 # ====== 天气 ======
 async def check_weather(ctx, content):
-    if not _feature_enabled("builtin.fun"):
-        return False
     match = re.match(r"^(.{1,10}?)天气$", content)
     if match:
         city = match.group(1)
@@ -1433,15 +1848,12 @@ async def process_message(ctx, content):
         return
 
     user_id = ctx["user_openid"]
+    _record_seen_user(ctx)
     now = _time_mod.time()
 
     # 0a. 点歌选择状态
     sel = _music_select.get(user_id)
     if sel and now - sel.get("ts", 0) < 120 and content.isdigit():
-        if not _feature_enabled("builtin.music"):
-            del _music_select[user_id]
-            await _reply_feature_disabled(ctx, "点歌")
-            return
         idx = int(content)
         songs = sel.get("songs", [])
         if 1 <= idx <= len(songs):
@@ -1458,10 +1870,6 @@ async def process_message(ctx, content):
     # 0b. GitHub 选择状态
     gsel = _github_select.get(user_id)
     if gsel and now - gsel.get("ts", 0) < 120 and content.isdigit():
-        if not _feature_enabled("builtin.github"):
-            del _github_select[user_id]
-            await _reply_feature_disabled(ctx, "GitHub 搜索")
-            return
         idx = int(content)
         repos = gsel.get("repos", [])
         if 1 <= idx <= len(repos):
@@ -1478,10 +1886,6 @@ async def process_message(ctx, content):
     # 0c. 点歌等待输入歌名
     mw = _music_waiting.get(user_id)
     if mw and now - mw.get("ts", 0) < 60:
-        if not _feature_enabled("builtin.music"):
-            del _music_waiting[user_id]
-            await _reply_feature_disabled(ctx, "点歌")
-            return
         del _music_waiting[user_id]
         songs = await music.search_music(content)
         if songs:
@@ -1504,7 +1908,9 @@ async def process_message(ctx, content):
             del _fuzzy_waiting[user_id]
             real_cmd = fw["command"]
             _log.info(f"[模糊指令] 确认执行: {real_cmd}")
-            await handle_command(ctx, real_cmd)
+            handled = await handle_command(ctx, real_cmd)
+            if handled:
+                _log_command_event(ctx, real_cmd)
             return
         if lowered in ("n", "no", "取消", "算了"):
             del _fuzzy_waiting[user_id]
@@ -1515,21 +1921,18 @@ async def process_message(ctx, content):
 
     # 1. 指令
     if await handle_command(ctx, content):
+        _log_command_event(ctx, content)
         return
 
-    # 2. 插件指令
-    if await handle_plugin(ctx, content):
-        return
-
-    # 3. 天气
+    # 2. 天气
     if await check_weather(ctx, content):
         return
 
-    # 4. 链接解析
+    # 3. 链接解析
     if await check_links(ctx, content):
         return
 
-    # 5. 模糊指令匹配（非已知指令才触发）
+    # 4. 模糊指令匹配（非已知指令才触发）
     if content.lower().strip() not in _KNOWN_COMMANDS:
         fuzzy = _find_fuzzy(content)
         if fuzzy:
@@ -1540,9 +1943,7 @@ async def process_message(ctx, content):
             )
             return
 
-    # 6. AI 对话
-    if not _feature_enabled("builtin.ai_chat"):
-        return
+    # 5. AI 对话
     chat_id = f"{ctx['type']}_{user_id}"
     ai_reply = await ai_chat.chat(chat_id, content)
     if len(ai_reply) > 2000:
@@ -1551,49 +1952,188 @@ async def process_message(ctx, content):
 
 
 # ====== 事件处理 ======
-async def handle_group_message(data):
-    group_openid = data.get("group_openid", "")
-    msg_id = data.get("id", "")
-    user_openid = data.get("author", {}).get("member_openid", "")
-    content = data.get("content", "").strip()
+async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
+    event = adapt_message_event(event_type, data, FULL_MESSAGE_GROUP_IDS)
+    if not event:
+        _log.debug(
+            f"[群消息忽略] event={event_type} group={data.get('group_openid', '')}"
+        )
+        return
 
-    _log.info(f"[群消息] {user_openid[:8]}...: {content[:50]}")
+    if not _remember_group_message(event.group_openid, event.msg_id):
+        _log.debug(
+            f"[群消息去重] event={event.event_type} "
+            f"group={event.group_openid} msg={event.msg_id}"
+        )
+        return
 
-    ctx = {
-        "type": "group",
-        "group_openid": group_openid,
-        "user_openid": user_openid,
-        "msg_id": msg_id,
-    }
-    await process_message(ctx, content)
+    _log.info(
+        f"[群消息] event={event.event_type} group={event.group_openid} "
+        f"user={event.user_openid[:8]}...: {event.content[:50]}"
+    )
+    await process_message(event.to_ctx(), event.content)
 
 
 async def handle_c2c_message(data):
-    user_openid = data.get("author", {}).get("user_openid", "")
-    msg_id = data.get("id", "")
-    content = data.get("content", "").strip()
+    event = adapt_message_event(C2C_MESSAGE_CREATE, data, FULL_MESSAGE_GROUP_IDS)
+    if not event:
+        return
 
-    _log.info(f"[私聊] {user_openid[:8]}...: {content[:50]}")
+    _log.info(f"[私聊] {event.user_openid[:8]}...: {event.content[:50]}")
+    await process_message(event.to_ctx(), event.content)
 
-    ctx = {
-        "type": "c2c",
-        "group_openid": "",
-        "user_openid": user_openid,
-        "msg_id": msg_id,
-    }
-    await process_message(ctx, content)
+
+async def handle_koishi_bridge_payload(payload: dict):
+    event = adapt_koishi_payload(payload, FULL_MESSAGE_GROUP_IDS)
+    if not event:
+        return {"ok": True, "ignored": True}
+
+    if event.type == "group" and not _remember_group_message(
+        event.group_openid, event.msg_id
+    ):
+        _log.debug(
+            f"[KoishiBridge去重] group={event.group_openid} msg={event.msg_id}"
+        )
+        return {"ok": True, "ignored": True, "reason": "duplicate"}
+
+    _log.info(
+        f"[KoishiBridge] type={event.type} group={event.group_openid} "
+        f"user={event.user_openid[:8]}...: {event.content[:50]}"
+    )
+    await process_message(event.to_ctx(), event.content)
+    return {"ok": True, "ignored": False}
+
+
+def _build_qq_webhook_signature(app_secret: str, event_ts: str, plain_token: str) -> str:
+    secret_bytes = str(app_secret or "").encode("utf-8")
+    if not secret_bytes:
+        raise ValueError("QQ_APP_SECRET is required for webhook validation")
+    while len(secret_bytes) < 32:
+        secret_bytes = (secret_bytes + secret_bytes)[:32]
+    key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes[:32])
+    return key.sign(f"{event_ts}{plain_token}".encode("utf-8")).hex()
+
+
+async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None):
+    if not isinstance(payload, dict):
+        return {"status": "ignored", "reason": "invalid_payload"}
+
+    data = payload.get("d", {})
+    if isinstance(data, dict) and "event_ts" in data and "plain_token" in data:
+        plain_token = str(data.get("plain_token", ""))
+        event_ts = str(data.get("event_ts", ""))
+        return {
+            "plain_token": plain_token,
+            "signature": _build_qq_webhook_signature(
+                app_secret or APP_SECRET,
+                event_ts,
+                plain_token,
+            ),
+        }
+
+    event_type = str(payload.get("t") or payload.get("event_type") or "")
+    if not isinstance(data, dict):
+        data = {}
+
+    if event_type in GROUP_MESSAGE_EVENTS:
+        await handle_group_message(data, event_type)
+    elif event_type == C2C_MESSAGE_CREATE:
+        await handle_c2c_message(data)
+    elif event_type:
+        _log.info(
+            f"[QQWebhook] event={event_type} "
+            f"keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+        )
+    else:
+        _log.debug("[QQWebhook] ignored payload without event type")
+
+    return {"status": "success"}
+
+
+def _bridge_token_matches(expected: str, actual: str) -> bool:
+    if not expected:
+        return True
+    return actual == expected
+
+
+async def run_koishi_bridge_server():
+    from aiohttp import web
+
+    async def health(_request):
+        return web.json_response({"ok": True})
+
+    async def receive_message(request):
+        if not _bridge_token_matches(
+            BRIDGE_TOKEN, request.headers.get("X-Bridge-Token", "")
+        ):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        result = await handle_koishi_bridge_payload(payload)
+        return web.json_response(result)
+
+    async def receive_qq_webhook(request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+
+        try:
+            result = await handle_qq_webhook_payload(payload)
+        except Exception as e:
+            _log.error(f"[QQWebhook] 处理失败: {e}")
+            return web.json_response({"status": "error", "error": "handler_failed"}, status=500)
+        return web.json_response(result)
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/koishi/message", receive_message)
+    app.router.add_post(QQ_WEBHOOK_PATH, receive_qq_webhook)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, BRIDGE_HOST, BRIDGE_PORT)
+    await site.start()
+    _log.info(
+        f"[KoishiBridge] listening on http://{BRIDGE_HOST}:{BRIDGE_PORT}, "
+        f"qq_webhook={QQ_WEBHOOK_PATH}"
+    )
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
 
 
 # ====== WebSocket ======
 async def get_gateway_url():
     headers = await get_gateway_auth_header()
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{API_BASE}/gateway", headers=headers)
+        resp = await client.get(f"{API_BASE}/gateway/bot", headers=headers)
         if resp.status_code != 200:
             _log.warning(f"[Gateway] {resp.status_code}: {resp.text[:300]}")
+            return ""
         url = resp.json().get("url", "")
         _log.info(f"[Gateway] {url}")
         return url
+
+
+async def _send_heartbeat_once(ws, seq):
+    try:
+        await ws.send(json.dumps({"op": 1, "d": seq}))
+        return True
+    except Exception as e:
+        _log.warning(f"[WS] 心跳发送失败，准备重连: {e}")
+        try:
+            await ws.close()
+        except Exception as close_error:
+            _log.debug(f"[WS] 心跳失败后关闭连接也失败: {close_error}")
+        return False
 
 
 async def run_websocket():
@@ -1620,7 +2160,8 @@ async def run_websocket():
                 async def send_heartbeat():
                     while True:
                         await asyncio.sleep(heartbeat_interval / 1000)
-                        await ws.send(json.dumps({"op": 1, "d": last_seq}))
+                        if not await _send_heartbeat_once(ws, last_seq):
+                            return
 
                 try:
                     async for raw in ws:
@@ -1657,7 +2198,7 @@ async def run_websocket():
                                             "op": 2,
                                             "d": {
                                                 "token": f"QQBot {_access_token}",
-                                                "intents": (1 << 25),
+                                                "intents": GATEWAY_INTENTS,
                                                 "shard": [0, 1],
                                             },
                                         }
@@ -1674,9 +2215,9 @@ async def run_websocket():
                                 )
                             elif t == "RESUMED":
                                 _log.info("[WS] Resumed")
-                            elif t == "GROUP_AT_MESSAGE_CREATE":
-                                asyncio.create_task(handle_group_message(d))
-                            elif t == "C2C_MESSAGE_CREATE":
+                            elif t in GROUP_MESSAGE_EVENTS:
+                                asyncio.create_task(handle_group_message(d, t))
+                            elif t == C2C_MESSAGE_CREATE:
                                 asyncio.create_task(handle_c2c_message(d))
                             elif t in (
                                 "GROUP_ADD_ROBOT",
@@ -1686,7 +2227,15 @@ async def run_websocket():
                             ):
                                 _log.info(f"[事件] {t}")
                             else:
-                                _log.debug(f"[WS] {t}")
+                                if t:
+                                    _log.info(
+                                        f"[WS事件未处理] t={t} "
+                                        f"keys={list(d.keys()) if isinstance(d, dict) else type(d).__name__} "
+                                        f"group={d.get('group_openid', '') if isinstance(d, dict) else ''} "
+                                        f"id={d.get('id', '') if isinstance(d, dict) else ''}"
+                                    )
+                                else:
+                                    _log.debug(f"[WS] {t}")
 
                         elif op == 11:
                             pass
@@ -1694,7 +2243,7 @@ async def run_websocket():
                             _log.warning("[WS] 要求重连")
                             break
                         elif op == 9:
-                            _log.warning("[WS] Session 失效")
+                            _log.warning(f"[WS] Session 失效/鉴权失败: d={d}")
                             session_id = ""
                             last_seq = None
                             break
@@ -1721,6 +2270,18 @@ async def token_refresh_loop():
             _log.warning(f"[Auth] 刷新失败: {e}")
 
 
+def _build_runtime_tasks(
+    official_ws_enabled: bool = OFFICIAL_WS_ENABLED,
+    bridge_enabled: bool = BRIDGE_ENABLED,
+):
+    tasks = [token_refresh_loop()]
+    if official_ws_enabled:
+        tasks.insert(0, run_websocket())
+    if bridge_enabled:
+        tasks.append(run_koishi_bridge_server())
+    return tasks
+
+
 async def main():
     _log.info("=" * 50)
     _log.info("QQ 官方 Bot 全功能版启动")
@@ -1728,9 +2289,12 @@ async def main():
     _log.info(
         f"环境: {'沙箱' if SANDBOX else '正式'} | AI: {AI_CONFIG.get('model', '?')}"
     )
+    _log.info(f"Gateway intents: {GATEWAY_INTENTS}")
+    _log.info(f"Official WS enabled: {OFFICIAL_WS_ENABLED}")
+    _log.info(f"Bridge listener enabled: {BRIDGE_ENABLED}")
     _log.info("=" * 50)
     await refresh_access_token()
-    await asyncio.gather(run_websocket(), token_refresh_loop())
+    await asyncio.gather(*_build_runtime_tasks())
 
 
 if __name__ == "__main__":

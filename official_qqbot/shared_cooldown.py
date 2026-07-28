@@ -17,6 +17,23 @@ SHARED_FILE = os.path.join(
 # 内存缓存 + 文件同步
 _cache: dict = {}
 _last_load_ts: float = 0
+RESTRICT_WINDOWS = {
+    "min": 60,
+    "hour": 3600,
+    "day": 86400,
+    "month": 30 * 86400,
+    "quarter": 90 * 86400,
+    "year": 365 * 86400,
+}
+RESTRICT_FEATURES = {"163", "4399", "nfa"}
+RESTRICT_STATS_WINDOWS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "month": 30 * 86400,
+    "year": 365 * 86400,
+}
 _RELOAD_INTERVAL = 1.0  # 每次检查前最多 1 秒读一次文件
 
 
@@ -40,9 +57,14 @@ def _load():
 def _save():
     """把状态写回共享文件"""
     try:
-        os.makedirs(os.path.dirname(SHARED_FILE), exist_ok=True)
-        with open(SHARED_FILE, "w", encoding="utf-8") as f:
+        data_dir = os.path.dirname(SHARED_FILE)
+        os.makedirs(data_dir, exist_ok=True)
+        tmp_file = f"{SHARED_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(_cache, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, SHARED_FILE)
     except Exception as e:
         _log.warning(f"[共享冷却] 写文件失败: {e}")
 
@@ -136,3 +158,147 @@ def record_usage(feature: str, user_id: int):
     logs[uid] = hour_log
 
     _save()
+
+
+def set_restrict_rule(feature: str, limit: int, unit: str) -> None:
+    feature = str(feature).strip().lower()
+    unit = str(unit).strip().lower()
+    if feature not in RESTRICT_FEATURES:
+        raise ValueError("invalid feature")
+    if limit <= 0:
+        raise ValueError("invalid limit")
+    if unit not in RESTRICT_WINDOWS:
+        raise ValueError("invalid unit")
+
+    _load()
+    rules = _section("restrict_rules")
+    rules[feature] = {
+        "limit": int(limit),
+        "unit": unit,
+        "window": RESTRICT_WINDOWS[unit],
+    }
+    _save()
+
+
+def get_restrict_rule(feature: str) -> dict | None:
+    _load()
+    rule = _section("restrict_rules").get(str(feature).strip().lower())
+    return rule if isinstance(rule, dict) else None
+
+
+def _recent_restrict_usage(feature: str, user_id, now: float, window: int) -> list[float]:
+    logs = _section("restrict_log")
+    feature_logs = logs.setdefault(feature, {})
+    recent = [
+        float(ts)
+        for ts in (feature_logs.get(str(user_id)) or [])
+        if now - float(ts) < window
+    ]
+    feature_logs[str(user_id)] = recent
+    return recent
+
+
+def get_restrict_status(feature: str, user_id) -> dict:
+    feature = str(feature).strip().lower()
+    rule = get_restrict_rule(feature)
+    if not rule:
+        return {
+            "blocked": False,
+            "count": 0,
+            "limit": 0,
+            "window": 0,
+            "reset_after": 0,
+        }
+
+    limit = int(rule.get("limit", 0) or 0)
+    window = int(rule.get("window", 0) or 0)
+    if limit <= 0 or window <= 0:
+        return {
+            "blocked": False,
+            "count": 0,
+            "limit": 0,
+            "window": 0,
+            "reset_after": 0,
+        }
+
+    _load()
+    now = time.time()
+    recent = _recent_restrict_usage(feature, user_id, now, window)
+    _save()
+
+    reset_after = 0
+    if recent:
+        reset_after = max(0, int(window - (now - min(recent))))
+
+    return {
+        "blocked": len(recent) >= limit,
+        "count": len(recent),
+        "limit": limit,
+        "window": window,
+        "reset_after": reset_after,
+    }
+
+
+def check_restrict_limit(feature: str, user_id) -> tuple[bool, int, int, int]:
+    status = get_restrict_status(feature, user_id)
+    return (
+        bool(status["blocked"]),
+        int(status["count"]),
+        int(status["limit"]),
+        int(status["window"]),
+    )
+
+
+def record_restrict_usage(feature: str, user_id) -> None:
+    feature = str(feature).strip().lower()
+    if not get_restrict_rule(feature):
+        return
+
+    _load()
+    uid = str(user_id)
+    now = time.time()
+    logs = _section("restrict_log")
+    feature_logs = logs.setdefault(feature, {})
+    recent = list(feature_logs.get(uid) or [])
+    recent.append(now)
+    feature_logs[uid] = recent
+    _save()
+
+
+def reset_restrict_usage() -> None:
+    """清空所有资源获取限制记录，保留 /restrict 规则。"""
+    _load()
+    _cache["restrict_log"] = {}
+    _save()
+
+
+def get_restrict_usage_stats() -> list[dict]:
+    _load()
+    now = time.time()
+    rules = _section("restrict_rules")
+    logs = _section("restrict_log")
+    items = []
+    for feature in sorted(RESTRICT_FEATURES):
+        rule = rules.get(feature) if isinstance(rules, dict) else None
+        if not isinstance(rule, dict):
+            continue
+        feature_logs = logs.get(feature, {}) if isinstance(logs, dict) else {}
+        all_timestamps = [
+            float(ts)
+            for user_logs in feature_logs.values()
+            for ts in (user_logs or [])
+        ]
+        counts = {
+            key: sum(1 for ts in all_timestamps if now - ts <= seconds)
+            for key, seconds in RESTRICT_STATS_WINDOWS.items()
+        }
+        items.append(
+            {
+                "resource": feature,
+                "limit_count": int(rule.get("limit", 0) or 0),
+                "window_unit": str(rule.get("unit", "") or ""),
+                "window_seconds": int(rule.get("window", 0) or 0),
+                "counts": counts,
+            }
+        )
+    return items

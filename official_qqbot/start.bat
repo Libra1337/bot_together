@@ -3,6 +3,14 @@ chcp 65001 >nul 2>&1
 title QQ Official Bot
 cd /d "%~dp0"
 
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" --version >nul 2>&1
+    if errorlevel 1 (
+        echo Existing venv is broken, recreating...
+        rmdir /s /q ".venv"
+    )
+)
+
 if not exist ".venv\Scripts\python.exe" (
     echo Creating venv...
     python -m venv .venv

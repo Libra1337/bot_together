@@ -1,0 +1,16 @@
+[Unit]
+Description=Official QQBot Python Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/official_qqbot
+EnvironmentFile=/etc/official-qqbot/koishi-bridge.env
+ExecStart=/opt/official_qqbot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

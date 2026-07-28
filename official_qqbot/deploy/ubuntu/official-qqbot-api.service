@@ -1,0 +1,15 @@
+[Unit]
+Description=Official QQBot Control API and Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/official_qqbot
+EnvironmentFile=/etc/official-qqbot/koishi-bridge.env
+ExecStart=/opt/official_qqbot/.venv/bin/python -m control_api.app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

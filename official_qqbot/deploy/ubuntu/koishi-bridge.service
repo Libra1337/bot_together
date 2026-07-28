@@ -1,0 +1,15 @@
+[Unit]
+Description=Koishi QQ Crack Bridge
+After=network-online.target official-qqbot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/official_qqbot/koishi-bridge
+EnvironmentFile=/etc/official-qqbot/koishi-bridge.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

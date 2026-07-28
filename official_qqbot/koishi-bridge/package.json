@@ -1,0 +1,14 @@
+{
+  "name": "official-qqbot-koishi-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "koishi start koishi.config.js"
+  },
+  "dependencies": {
+    "@koishijs/plugin-database-sqlite": "^4.7.0",
+    "koishi": "^4.18.9",
+    "koishi-plugin-adapter-qq-crack": "^1.0.6"
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=NoneBot QQ Bridge
+After=network-online.target official-qqbot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/official_qqbot
+EnvironmentFile=/etc/official-qqbot/koishi-bridge.env
+ExecStart=/opt/official_qqbot/.venv/bin/python nonebot_bridge.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

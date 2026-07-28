@@ -1,3 +1,10 @@
 pyyaml
 httpx
 websockets
+aiohttp
+fastapi
+sqlalchemy
+uvicorn
+psycopg[binary]
+nonebot2[httpx,websockets]
+nonebot-adapter-qq
