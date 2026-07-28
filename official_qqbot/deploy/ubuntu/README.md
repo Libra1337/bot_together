@@ -26,7 +26,7 @@ For AI chat, set:
 
 ```text
 AI_BASE_URL=https://fisx-ai.guimc.ltd/v1
-AI_MODEL=grok-4.5
+AI_MODEL=deepseek-v4-flash
 AI_API_KEY=your-private-api-key
 ```
 

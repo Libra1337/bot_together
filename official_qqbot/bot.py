@@ -128,7 +128,7 @@ AI_BASE_URL = str(
     or ""
 )
 AI_API_KEY = str(_config_value(AI_CONFIG, "api_key", "AI_API_KEY", "") or "")
-AI_MODEL = str(_config_value(AI_CONFIG, "model", "AI_MODEL", "grok-4.5") or "")
+AI_MODEL = str(_config_value(AI_CONFIG, "model", "AI_MODEL", "deepseek-v4-flash") or "")
 AI_CONFIG["base_url"] = AI_BASE_URL
 AI_CONFIG["api_key"] = AI_API_KEY
 AI_CONFIG["model"] = AI_MODEL

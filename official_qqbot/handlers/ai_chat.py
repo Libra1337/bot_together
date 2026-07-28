@@ -83,7 +83,12 @@ class AIChat:
             if not choices:
                 return "AI 返回为空喵~"
 
-            reply = choices[0].get("message", {}).get("content", "").strip()
+            message = choices[0].get("message", {})
+            reply = (
+                message.get("content")
+                or message.get("reasoning_content")
+                or ""
+            ).strip()
             if not reply:
                 return "AI 返回为空喵~"
 
