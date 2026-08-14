@@ -28,7 +28,7 @@ class SauthApiTests(unittest.IsolatedAsyncioTestCase):
     def test_get_sauth_accepts_user_key_for_single_flight(self):
         self.assertIn("user_key", inspect.signature(sauth.get_sauth).parameters)
 
-    async def test_502_makes_exactly_one_post_with_thirty_second_timeout(self):
+    async def test_502_makes_exactly_one_post_with_sixty_five_second_timeout(self):
         client = Mock()
         client.post = AsyncMock(return_value=response(502))
 
@@ -42,7 +42,7 @@ class SauthApiTests(unittest.IsolatedAsyncioTestCase):
         client.post.assert_awaited_once_with(
             sauth.SAUTH_API,
             headers={"X-Api-Key": sauth.SAUTH_API_KEY},
-            timeout=30.0,
+            timeout=65.0,
         )
 
     async def test_timeout_makes_exactly_one_post(self):
