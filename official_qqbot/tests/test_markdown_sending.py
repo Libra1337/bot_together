@@ -359,5 +359,170 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("限额刷新：1小时后", reply_text)
 
 
+    async def test_private_resource_message_sends_direct_reply_without_email(self):
+        ctx = {
+            "type": "c2c",
+            "user_openid": "user-a",
+            "group_openid": "",
+            "msg_id": "msg-a",
+        }
+
+        with patch.object(
+            bot, "_get_bound_email", return_value="user@example.com"
+        ), patch.object(
+            bot,
+            "_get_active_ads",
+            return_value=["ad-a", "ad-b"],
+        ), patch.object(
+            bot, "_send_result_email", new_callable=AsyncMock
+        ) as send_email, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            reply.return_value = True
+            send_email.return_value = (True, "")
+
+            ok = await bot._send_resource_result(
+                ctx,
+                "user-a",
+                "163",
+                "163 小号",
+                "Miracle 163 小号",
+                "account: demo\npassword: secret",
+                quota_text="当前获取: 1/3\n额度刷新: 23h23min23s",
+            )
+
+        self.assertTrue(ok)
+        send_email.assert_not_awaited()
+        reply.assert_awaited_once()
+        reply_text = reply.await_args.args[1]
+        self.assertIn("account: demo", reply_text)
+        self.assertIn("password: secret", reply_text)
+        self.assertIn("当前获取: 1/3", reply_text)
+        self.assertIn("额度刷新: 23h23min23s", reply_text)
+        self.assertNotIn("ad-a", reply_text)
+        self.assertNotIn("ad-b", reply_text)
+
+    async def test_private_resource_message_falls_back_to_email_when_reply_fails(self):
+        ctx = {
+            "type": "c2c",
+            "user_openid": "user-a",
+            "group_openid": "",
+            "msg_id": "msg-a",
+        }
+
+        with patch.object(
+            bot, "_get_bound_email", return_value="user@example.com"
+        ), patch.object(
+            bot,
+            "_get_active_ads",
+            return_value=["ad-a"],
+        ), patch.object(
+            bot, "_send_result_email", new_callable=AsyncMock
+        ) as send_email, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            send_email.return_value = (True, "")
+            events = []
+
+            def record_reply(*args, **kwargs):
+                events.append("reply")
+                return False
+
+            def record_email(*args, **kwargs):
+                events.append("email")
+                return (True, "")
+
+            reply.side_effect = record_reply
+            send_email.side_effect = record_email
+
+            ok = await bot._send_resource_result(
+                ctx,
+                "user-a",
+                "163",
+                "163 小号",
+                "Miracle 163 小号",
+                "account: demo\npassword: secret",
+                quota_text="当前获取: 1/3",
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(events, ["reply", "email"])
+        send_email.assert_awaited_once()
+        email_body = send_email.await_args.args[2]
+        self.assertIn("account: demo", email_body)
+        self.assertIn("ad-a", email_body)
+        reply.assert_awaited_once()
+
+    async def test_private_resource_message_without_email_fails_when_reply_fails(self):
+        ctx = {
+            "type": "c2c",
+            "user_openid": "user-a",
+            "group_openid": "",
+            "msg_id": "msg-a",
+        }
+
+        with patch.object(
+            bot, "_get_bound_email", return_value=""
+        ), patch.object(
+            bot, "_send_result_email", new_callable=AsyncMock
+        ) as send_email, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            reply.return_value = False
+
+            ok = await bot._send_resource_result(
+                ctx,
+                "user-a",
+                "163",
+                "163 小号",
+                "Miracle 163 小号",
+                "account: demo\npassword: secret",
+                quota_text="当前获取: 1/3",
+            )
+
+        self.assertFalse(ok)
+        reply.assert_awaited_once()
+        send_email.assert_not_awaited()
+
+    async def test_group_resource_email_failure_does_not_post_resource_to_chat(self):
+        ctx = {
+            "type": "group",
+            "user_openid": "user-a",
+            "group_openid": "group-a",
+            "msg_id": "msg-a",
+        }
+
+        with patch.object(
+            bot, "_get_bound_email", return_value="user@example.com"
+        ), patch.object(
+            bot,
+            "_get_active_ads",
+            return_value=["ad-a"],
+        ), patch.object(
+            bot, "_send_result_email", new_callable=AsyncMock
+        ) as send_email, patch.object(
+            bot, "reply", new_callable=AsyncMock
+        ) as reply:
+            send_email.return_value = (False, "smtp down")
+
+            ok = await bot._send_resource_result(
+                ctx,
+                "user-a",
+                "163",
+                "163 小号",
+                "Miracle 163 小号",
+                "account: demo\npassword: secret",
+                quota_text="当前获取: 1/3",
+            )
+
+        self.assertFalse(ok)
+        reply.assert_awaited_once()
+        reply_text = reply.await_args.args[1]
+        self.assertIn("邮件发送失败", reply_text)
+        self.assertNotIn("account: demo", reply_text)
+        self.assertNotIn("password: secret", reply_text)
+        self.assertNotIn("ad-a", reply_text)
+
+
 if __name__ == "__main__":
     unittest.main()

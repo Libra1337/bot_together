@@ -319,6 +319,7 @@ def _log_email_outbound(
 
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_QQ_NUMBER_RE = re.compile(r"^[1-9]\d{4,11}$")
 
 
 async def _send_result_email(to_addr: str, subject: str, body: str) -> tuple[bool, str]:
@@ -343,6 +344,13 @@ def _normalize_email_addr(email: str) -> str:
 
 def _is_valid_email_addr(email: str) -> bool:
     return bool(_EMAIL_RE.match(_normalize_email_addr(email)))
+
+
+def _qq_number_to_email(value: str) -> str:
+    qq_number = (value or "").strip()
+    if not _QQ_NUMBER_RE.match(qq_number):
+        return ""
+    return f"{qq_number}@qq.com"
 
 
 def _get_bound_email(user_id: str) -> str:
@@ -370,6 +378,10 @@ async def _require_bound_email(ctx, user_id: str) -> bool:
     return False
 
 
+def _resource_request_requires_email(ctx) -> bool:
+    return ctx.get("type") != "c2c"
+
+
 async def _send_resource_result(
     ctx,
     user_id: str,
@@ -381,6 +393,29 @@ async def _send_resource_result(
 ) -> bool:
     to_addr = _get_bound_email(user_id)
     delivery_body = _append_quota_text(result, quota_text)
+
+    if ctx.get("type") == "c2c":
+        ok = await reply(ctx, delivery_body)
+        if ok:
+            return True
+        if not to_addr:
+            _log.warning(f"[{resource_key}] 私聊发送失败且未绑定邮箱 -> {user_id[:8]}...")
+            return False
+
+        email_body = _append_full_ads_to_email(delivery_body)
+        ok, err = await _send_result_email(to_addr, subject, email_body)
+        masked_addr = _mask_email_addr(to_addr)
+        _log_email_outbound(ctx, user_id, ok, subject, masked_addr)
+        if ok:
+            return True
+
+        _log.warning(f"[{resource_key}] 私聊发送失败，邮箱兜底也失败 -> {masked_addr}: {err}")
+        return False
+
+    if not to_addr:
+        await _require_bound_email(ctx, user_id)
+        return False
+
     email_body = _append_full_ads_to_email(delivery_body)
     ok, err = await _send_result_email(to_addr, subject, email_body)
     masked_addr = _mask_email_addr(to_addr)
@@ -393,7 +428,7 @@ async def _send_resource_result(
         return True
 
     _log.warning(f"[{resource_key}] 邮件发送失败 -> {masked_addr}: {err}")
-    await reply(ctx, f"{resource_label} 邮件发送失败，已改为当前会话发送喵~\n{email_body}")
+    await reply(ctx, f"{resource_label} 邮件发送失败，请检查绑定邮箱或稍后再试喵~")
     return False
 
 
@@ -804,23 +839,21 @@ async def get_gateway_auth_header():
 
 # ====== 消息发送 ======
 _msg_seq_counter: dict[str, int] = {}
-_INBOUND_MSG_CACHE_MAX = 1000
-_recent_inbound_msg_ids: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+_INBOUND_GROUP_MSG_CACHE_MAX = 1000
+_recent_group_msg_ids: OrderedDict[str, float] = OrderedDict()
 
 
-def _remember_inbound_message(
-    message_type: str, conversation_id: str, msg_id: str
-) -> bool:
+def _remember_group_message(group_openid: str, msg_id: str) -> bool:
     if not msg_id:
         return True
 
-    key = (message_type, conversation_id, msg_id)
-    if key in _recent_inbound_msg_ids:
+    key = f"{group_openid}:{msg_id}"
+    if key in _recent_group_msg_ids:
         return False
 
-    _recent_inbound_msg_ids[key] = _time_mod.time()
-    while len(_recent_inbound_msg_ids) > _INBOUND_MSG_CACHE_MAX:
-        _recent_inbound_msg_ids.popitem(last=False)
+    _recent_group_msg_ids[key] = _time_mod.time()
+    while len(_recent_group_msg_ids) > _INBOUND_GROUP_MSG_CACHE_MAX:
+        _recent_group_msg_ids.popitem(last=False)
     return True
 
 
@@ -1038,6 +1071,7 @@ async def reply(ctx, text):
     else:
         ok = await send_c2c_msg(ctx["user_openid"], text, ctx["msg_id"])
         _log_outbound_event(ctx, "c2c", ok, text)
+    return ok
 
 
 async def reply_markdown_card(ctx, markdown: str, button_rows: list[list[dict]]):
@@ -1136,7 +1170,7 @@ async def handle_command(ctx, content):
                 "4399 — 获取 4399 Sauth\n"
                 "163 — 领取 163 小号\n"
                 "stock — 查看全部库存\n"
-                "/bind 邮箱 — 绑定资源接收邮箱（领取前必需）\n"
+                "/bind 邮箱/QQ号 — 绑定资源接收地址（群聊领取前必需）\n"
                 "/unbind — 取消邮箱绑定\n"
                 "━━━ 查询功能 ━━━\n"
                 "bjd — 查询布吉岛版本\n"
@@ -1342,13 +1376,16 @@ async def handle_command(ctx, content):
         return True
 
     # ===== 绑定邮箱 =====
-    bind_match = re.match(r"^(?:/bind|绑定邮箱|/绑定邮箱)\s+(\S+@\S+\.\S+)$", content, re.IGNORECASE)
+    bind_match = re.match(r"^(?:/bind|绑定邮箱|/绑定邮箱|绑定QQ号|绑定qq号|/bindqq)\s+(\S+)$", content, re.IGNORECASE)
     if bind_match:
-        email = _normalize_email_addr(bind_match.group(1))
+        bind_target = bind_match.group(1)
+        email = _normalize_email_addr(bind_target)
+        if ctx.get("type") == "c2c" and not _is_valid_email_addr(email):
+            email = _qq_number_to_email(bind_target)
         if not _is_valid_email_addr(email):
             await reply(
                 ctx,
-                "邮箱格式不对喵~请输入：/bind 你的邮箱地址\n例如：/bind 123456@qq.com",
+                "格式不对喵~请输入：/bind 你的邮箱地址\n私聊也可以输入：/bind 你的QQ号\n例如：/bind 123456@qq.com",
             )
             return True
         _state_backend.set_email_binding(user_id, email)
@@ -1359,11 +1396,11 @@ async def handle_command(ctx, content):
         return True
 
     if lower in ("/bind", "bind", "绑定邮箱", "/绑定邮箱", "绑邮箱") or re.match(
-        r"^(?:/bind|绑定邮箱|/绑定邮箱)\s+", content, re.IGNORECASE
+        r"^(?:/bind|绑定邮箱|/绑定邮箱|绑定QQ号|绑定qq号|/bindqq)\s+", content, re.IGNORECASE
     ):
         await reply(
             ctx,
-            "请输入：/bind 你的邮箱地址\n例如：/bind 123456@qq.com\n绑定后才能领取 nfa/4399/163 喵~",
+            "请输入：/bind 你的邮箱地址\n私聊也可以输入：/bind 你的QQ号\n例如：/bind 123456@qq.com\n绑定后才能领取 nfa/4399/163 喵~",
         )
         return True
 
@@ -1402,7 +1439,7 @@ async def handle_command(ctx, content):
 
     # NFA
     if lower in ("nfa", "/nfa"):
-        if not await _require_bound_email(ctx, user_id):
+        if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
         if not await _check_resource_restrict(ctx, "nfa", limit_user_id):
             return True
@@ -1449,12 +1486,12 @@ async def handle_command(ctx, content):
 
     # 4399
     if lower in ("4399", "/4399"):
-        if not await _require_bound_email(ctx, user_id):
+        if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
         if not await _check_resource_restrict(ctx, "4399", limit_user_id):
             return True
 
-        success, result = await sauth.get_sauth(limit_user_id)
+        success, result = await sauth.get_sauth()
         if success:
             _record_resource_restrict("4399", limit_user_id)
             quota_text = _resource_success_quota_line("4399", limit_user_id)
@@ -1475,7 +1512,7 @@ async def handle_command(ctx, content):
 
     # 163
     if lower in ("163", "/163"):
-        if not await _require_bound_email(ctx, user_id):
+        if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
         if not await _check_resource_restrict(ctx, "163", limit_user_id):
             return True
@@ -1962,9 +1999,7 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         )
         return
 
-    if not _remember_inbound_message(
-        event.type, event.group_openid, event.msg_id
-    ):
+    if not _remember_group_message(event.group_openid, event.msg_id):
         _log.debug(
             f"[群消息去重] event={event.event_type} "
             f"group={event.group_openid} msg={event.msg_id}"
@@ -1983,12 +2018,6 @@ async def handle_c2c_message(data):
     if not event:
         return
 
-    if not _remember_inbound_message(event.type, event.user_openid, event.msg_id):
-        _log.debug(
-            f"[私聊去重] user={event.user_openid} msg={event.msg_id}"
-        )
-        return
-
     _log.info(f"[私聊] {event.user_openid[:8]}...: {event.content[:50]}")
     await process_message(event.to_ctx(), event.content)
 
@@ -1998,13 +2027,11 @@ async def handle_koishi_bridge_payload(payload: dict):
     if not event:
         return {"ok": True, "ignored": True}
 
-    conversation_id = (
-        event.group_openid if event.type == "group" else event.user_openid
-    )
-    if not _remember_inbound_message(event.type, conversation_id, event.msg_id):
+    if event.type == "group" and not _remember_group_message(
+        event.group_openid, event.msg_id
+    ):
         _log.debug(
-            f"[KoishiBridge去重] type={event.type} "
-            f"conversation={conversation_id} msg={event.msg_id}"
+            f"[KoishiBridge去重] group={event.group_openid} msg={event.msg_id}"
         )
         return {"ok": True, "ignored": True, "reason": "duplicate"}
 

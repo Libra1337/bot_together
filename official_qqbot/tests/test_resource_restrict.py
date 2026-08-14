@@ -158,6 +158,48 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         reset_usage.assert_called_once_with()
         reply_plain.assert_awaited_once()
 
+    async def test_private_resource_request_does_not_require_bound_email(self):
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot, "_check_resource_restrict", new_callable=AsyncMock
+        ) as check_restrict, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = False
+            check_restrict.return_value = True
+            get_sauth.return_value = (True, "token")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/4399")
+
+        self.assertTrue(handled)
+        require_email.assert_not_awaited()
+        get_sauth.assert_awaited_once()
+        send_result.assert_awaited_once()
+
+    async def test_group_resource_request_still_requires_bound_email(self):
+        group_ctx = {
+            "type": "group",
+            "user_openid": self.user_id,
+            "group_openid": "group-openid",
+            "msg_id": "msg-group",
+        }
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth:
+            require_email.return_value = False
+
+            handled = await bot.handle_command(group_ctx, "/4399")
+
+        self.assertTrue(handled)
+        require_email.assert_awaited_once_with(group_ctx, self.user_id)
+        get_sauth.assert_not_awaited()
+
     async def test_restricted_4399_does_not_call_upstream(self):
         with patch.object(
             bot._state_backend,
@@ -186,7 +228,6 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_successful_4399_records_restrict_usage(self):
-        self.ctx["limit_user_id"] = "global-user-openid"
         with patch.object(
             bot._state_backend,
             "get_resource_limit_status",
@@ -208,8 +249,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
-        get_sauth.assert_awaited_once_with("global-user-openid")
-        record_usage.assert_called_once_with("4399", "global-user-openid")
+        record_usage.assert_called_once_with("4399", self.user_id)
         self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
 
     async def test_restricted_nfa_does_not_call_upstream(self):

@@ -6,7 +6,7 @@ import bot
 
 class KoishiBridgeHandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        bot._recent_inbound_msg_ids.clear()
+        bot._recent_group_msg_ids.clear()
 
     async def test_bridge_payload_is_processed_for_whitelisted_group(self):
         payload = {

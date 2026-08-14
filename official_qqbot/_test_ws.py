@@ -1,8 +1,8 @@
-import asyncio, json, os, httpx, websockets
+import asyncio, json, httpx, websockets
 
 APP_ID = "1903707124"
-APP_SECRET = os.environ.get("QQ_APP_SECRET", "")
-BOT_TOKEN = os.environ.get("QQ_BOT_TOKEN", "")
+APP_SECRET = "QAvgSE1ocRG6wneWOHA4ytplifdbaZZZ"
+BOT_TOKEN = "K9S9YOLZcXiem0kZeWarwTvHbY6Wgodi"
 
 
 async def test():
