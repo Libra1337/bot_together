@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -132,6 +133,8 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         self.old_admins = set(bot._admin_set)
         self.old_state_backend = bot._state_backend
         bot._admin_set.add(self.user_id)
+        if hasattr(bot, "_active_resource_request_keys"):
+            bot._active_resource_request_keys.clear()
 
     def tearDown(self):
         bot._admin_set.clear()
@@ -251,6 +254,79 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         record_usage.assert_called_once_with("4399", self.user_id)
         self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
+
+    async def test_concurrent_4399_requests_for_same_user_fetch_once(self):
+        ctx_a = dict(self.ctx, msg_id="msg-resource-a")
+        ctx_b = dict(self.ctx, msg_id="msg-resource-b")
+
+        async def slow_get_sauth():
+            await asyncio.sleep(0.01)
+            return True, "token"
+
+        with patch.object(
+            bot, "_check_resource_restrict", new_callable=AsyncMock
+        ) as check_restrict, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            check_restrict.return_value = True
+            get_sauth.side_effect = slow_get_sauth
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(ctx_a, "/4399"),
+                bot.handle_command(ctx_b, "/4399"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        get_sauth.assert_awaited_once()
+        record_usage.assert_called_once_with("4399", self.user_id)
+        send_result.assert_awaited_once()
+
+    async def test_concurrent_private_and_group_4399_requests_both_deliver(self):
+        private_ctx = dict(self.ctx, msg_id="msg-private-4399")
+        group_ctx = {
+            "type": "group",
+            "user_openid": self.user_id,
+            "group_openid": "group-openid",
+            "msg_id": "msg-group-4399",
+        }
+
+        async def slow_get_sauth():
+            await asyncio.sleep(0.01)
+            return True, "token"
+
+        with patch.object(
+            bot, "_require_bound_email", new_callable=AsyncMock
+        ) as require_email, patch.object(
+            bot, "_check_resource_restrict", new_callable=AsyncMock
+        ) as check_restrict, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            require_email.return_value = True
+            check_restrict.return_value = True
+            get_sauth.side_effect = slow_get_sauth
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(private_ctx, "/4399"),
+                bot.handle_command(group_ctx, "/4399"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        self.assertEqual(get_sauth.await_count, 2)
+        self.assertEqual(record_usage.call_count, 2)
+        self.assertEqual(send_result.await_count, 2)
+        sent_contexts = [call.args[0] for call in send_result.await_args_list]
+        self.assertIn(private_ctx, sent_contexts)
+        self.assertIn(group_ctx, sent_contexts)
 
     async def test_restricted_nfa_does_not_call_upstream(self):
         with patch.object(
@@ -405,6 +481,45 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         self.assertEqual(check_limit.call_args_list[0].args, ("163", "global-user-openid"))
         record_usage.assert_called_once_with("163", "global-user-openid")
+
+    async def test_concurrent_163_requests_for_same_user_fetch_once(self):
+        ctx_a = dict(self.ctx, msg_id="msg-163-a")
+        ctx_b = dict(self.ctx, msg_id="msg-163-b")
+
+        async def slow_get_163():
+            await asyncio.sleep(0.01)
+            return True, "account: mail@example.com"
+
+        with patch.object(
+            bot, "_check_resource_restrict", new_callable=AsyncMock
+        ) as check_restrict, patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "check_hour_limit", return_value=(False, 0)
+        ), patch.object(
+            bot._shared_cd, "record_usage"
+        ), patch.object(
+            bot.sauth, "get_163_credentials", new_callable=AsyncMock
+        ) as get_163_credentials, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            check_restrict.return_value = True
+            get_163_credentials.side_effect = slow_get_163
+            send_result.return_value = True
+
+            handled = await asyncio.gather(
+                bot.handle_command(ctx_a, "/163"),
+                bot.handle_command(ctx_b, "/163"),
+            )
+
+        self.assertEqual(handled, [True, True])
+        get_163_credentials.assert_awaited_once()
+        record_usage.assert_called_once_with("163", self.user_id)
+        send_result.assert_awaited_once()
 
     async def test_stock_uses_163_inventory_api(self):
         with patch.object(bot.nfa, "get_nfa_stock", new_callable=AsyncMock) as get_nfa_stock, patch.object(

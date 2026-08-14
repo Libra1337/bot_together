@@ -65,6 +65,20 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["msg_id"], "msg-a")
         self.assertNotIn("content", payload)
 
+    async def test_private_message_uses_markdown_payload_by_default(self):
+        _CaptureClient.responses = [_Response(200, "ok")]
+
+        with patch.object(bot.httpx, "AsyncClient", _CaptureClient):
+            ok = await bot.send_c2c_msg("user-a", "## 标题\n正文", "msg-a")
+
+        self.assertTrue(ok)
+        payload = _CaptureClient.calls[0]["json"]
+        self.assertEqual(payload["msg_type"], 2)
+        self.assertEqual(payload["markdown"]["content"], "## 标题\n正文")
+        self.assertEqual(payload["msg_id"], "msg-a")
+        rows = payload["keyboard"]["content"]["rows"]
+        self.assertEqual([len(row["buttons"]) for row in rows], [2, 2])
+
     async def test_markdown_message_does_not_append_ads(self):
         _CaptureClient.responses = [_Response(200, "ok")]
 
@@ -359,7 +373,7 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("限额刷新：1小时后", reply_text)
 
 
-    async def test_private_resource_message_sends_direct_reply_without_email(self):
+    async def test_private_resource_message_sends_direct_reply_with_ads_without_email(self):
         ctx = {
             "type": "c2c",
             "user_openid": "user-a",
@@ -399,8 +413,8 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("password: secret", reply_text)
         self.assertIn("当前获取: 1/3", reply_text)
         self.assertIn("额度刷新: 23h23min23s", reply_text)
-        self.assertNotIn("ad-a", reply_text)
-        self.assertNotIn("ad-b", reply_text)
+        self.assertIn("ad-a", reply_text)
+        self.assertIn("ad-b", reply_text)
 
     async def test_private_resource_message_falls_back_to_email_when_reply_fails(self):
         ctx = {

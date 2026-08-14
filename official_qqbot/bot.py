@@ -395,15 +395,15 @@ async def _send_resource_result(
     delivery_body = _append_quota_text(result, quota_text)
 
     if ctx.get("type") == "c2c":
-        ok = await reply(ctx, delivery_body)
+        direct_body = _append_full_ads_to_email(delivery_body)
+        ok = await reply(ctx, direct_body)
         if ok:
             return True
         if not to_addr:
             _log.warning(f"[{resource_key}] 私聊发送失败且未绑定邮箱 -> {user_id[:8]}...")
             return False
 
-        email_body = _append_full_ads_to_email(delivery_body)
-        ok, err = await _send_result_email(to_addr, subject, email_body)
+        ok, err = await _send_result_email(to_addr, subject, direct_body)
         masked_addr = _mask_email_addr(to_addr)
         _log_email_outbound(ctx, user_id, ok, subject, masked_addr)
         if ok:
@@ -459,6 +459,25 @@ _163_BAN_DURATION = 86400
 
 _RESTRICT_FEATURES = {"163", "4399", "nfa"}
 _RESTRICT_UNITS = {"min", "hour", "day", "month", "quarter", "year"}
+_active_resource_request_keys: set[str] = set()
+
+
+def _resource_request_key(feature: str, user_id: str, ctx: dict) -> str:
+    chat_type = str(ctx.get("type") or "unknown").lower()
+    chat_id = str(ctx.get("group_openid") or ctx.get("user_openid") or user_id)
+    return f"{str(feature).lower()}:{chat_type}:{chat_id}:{user_id}"
+
+
+def _begin_resource_request(feature: str, user_id: str, ctx: dict) -> bool:
+    key = _resource_request_key(feature, user_id, ctx)
+    if key in _active_resource_request_keys:
+        return False
+    _active_resource_request_keys.add(key)
+    return True
+
+
+def _end_resource_request(feature: str, user_id: str, ctx: dict) -> None:
+    _active_resource_request_keys.discard(_resource_request_key(feature, user_id, ctx))
 
 # ====== 交互状态 ======
 # 点歌等待 {user_openid: {"ts": timestamp, "ctx": ctx}}
@@ -841,20 +860,31 @@ async def get_gateway_auth_header():
 _msg_seq_counter: dict[str, int] = {}
 _INBOUND_GROUP_MSG_CACHE_MAX = 1000
 _recent_group_msg_ids: OrderedDict[str, float] = OrderedDict()
+_recent_c2c_msg_ids: OrderedDict[str, float] = OrderedDict()
 
 
-def _remember_group_message(group_openid: str, msg_id: str) -> bool:
+def _remember_inbound_message(
+    cache: OrderedDict[str, float], scope: str, msg_id: str
+) -> bool:
     if not msg_id:
         return True
 
-    key = f"{group_openid}:{msg_id}"
-    if key in _recent_group_msg_ids:
+    key = f"{scope}:{msg_id}"
+    if key in cache:
         return False
 
-    _recent_group_msg_ids[key] = _time_mod.time()
-    while len(_recent_group_msg_ids) > _INBOUND_GROUP_MSG_CACHE_MAX:
-        _recent_group_msg_ids.popitem(last=False)
+    cache[key] = _time_mod.time()
+    while len(cache) > _INBOUND_GROUP_MSG_CACHE_MAX:
+        cache.popitem(last=False)
     return True
+
+
+def _remember_group_message(group_openid: str, msg_id: str) -> bool:
+    return _remember_inbound_message(_recent_group_msg_ids, group_openid, msg_id)
+
+
+def _remember_c2c_message(user_openid: str, msg_id: str) -> bool:
+    return _remember_inbound_message(_recent_c2c_msg_ids, user_openid, msg_id)
 
 
 # QQ 官方 API 禁止消息包含 URL 域名，需要脱敏
@@ -1491,6 +1521,10 @@ async def handle_command(ctx, content):
         if not await _check_resource_restrict(ctx, "4399", limit_user_id):
             return True
 
+        if not _begin_resource_request("4399", limit_user_id, ctx):
+            _log.info(f"[ResourceDedup] 4399 busy user={limit_user_id[:8]}...")
+            return True
+
         success, result = await sauth.get_sauth()
         if success:
             _record_resource_restrict("4399", limit_user_id)
@@ -1508,6 +1542,7 @@ async def handle_command(ctx, content):
         else:
             await reply(ctx, result)
         _log.info(f"[4399] {user_id[:8]}...")
+        _end_resource_request("4399", limit_user_id, ctx)
         return True
 
     # 163
@@ -1535,6 +1570,11 @@ async def handle_command(ctx, content):
                 ctx, f"一小时内频繁获取（{count}次），疑似偷卡，已封禁24小时喵~"
             )
             return True
+
+        if not _begin_resource_request("163", limit_user_id, ctx):
+            _log.info(f"[ResourceDedup] 163 busy user={limit_user_id[:8]}...")
+            return True
+
         _shared_cd.record_usage("163", limit_user_id)
 
         success, result_163 = await sauth.get_163_credentials()
@@ -1552,6 +1592,7 @@ async def handle_command(ctx, content):
             )
         else:
             await reply(ctx, result_163)
+        _end_resource_request("163", limit_user_id, ctx)
         return True
 
     # stock
@@ -2018,6 +2059,10 @@ async def handle_c2c_message(data):
     if not event:
         return
 
+    if not _remember_c2c_message(event.user_openid, event.msg_id):
+        _log.debug(f"[私聊去重] user={event.user_openid[:8]}... msg={event.msg_id}")
+        return
+
     _log.info(f"[私聊] {event.user_openid[:8]}...: {event.content[:50]}")
     await process_message(event.to_ctx(), event.content)
 
@@ -2034,7 +2079,13 @@ async def handle_koishi_bridge_payload(payload: dict):
             f"[KoishiBridge去重] group={event.group_openid} msg={event.msg_id}"
         )
         return {"ok": True, "ignored": True, "reason": "duplicate"}
-
+    if event.type == "c2c" and not _remember_c2c_message(
+        event.user_openid, event.msg_id
+    ):
+        _log.debug(
+            f"[KoishiBridge鍘婚噸] user={event.user_openid[:8]}... msg={event.msg_id}"
+        )
+        return {"ok": True, "ignored": True, "reason": "duplicate"}
     _log.info(
         f"[KoishiBridge] type={event.type} group={event.group_openid} "
         f"user={event.user_openid[:8]}...: {event.content[:50]}"

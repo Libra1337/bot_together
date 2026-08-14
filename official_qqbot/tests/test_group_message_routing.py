@@ -7,6 +7,7 @@ import bot
 class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot._recent_group_msg_ids.clear()
+        bot._recent_c2c_msg_ids.clear()
 
     async def test_non_at_group_message_is_processed_for_whitelisted_group(self):
         data = {
@@ -98,6 +99,19 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
             await bot.handle_group_message(data, "GROUP_MESSAGE_CREATE")
             await bot.handle_group_message(data, "GROUP_AT_MESSAGE_CREATE")
+
+        process.assert_awaited_once()
+
+    async def test_duplicate_c2c_message_id_is_processed_once(self):
+        data = {
+            "id": "msg-private-duplicate",
+            "author": {"user_openid": "user-openid"},
+            "content": "/4399",
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_c2c_message(data)
+            await bot.handle_c2c_message(data)
 
         process.assert_awaited_once()
 
