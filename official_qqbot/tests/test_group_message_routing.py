@@ -6,7 +6,7 @@ import bot
 
 class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        bot._recent_group_msg_ids.clear()
+        bot._recent_inbound_msg_ids.clear()
 
     async def test_non_at_group_message_is_processed_for_whitelisted_group(self):
         data = {

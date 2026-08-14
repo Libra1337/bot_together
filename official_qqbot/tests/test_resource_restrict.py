@@ -186,6 +186,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_successful_4399_records_restrict_usage(self):
+        self.ctx["limit_user_id"] = "global-user-openid"
         with patch.object(
             bot._state_backend,
             "get_resource_limit_status",
@@ -207,7 +208,8 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
-        record_usage.assert_called_once_with("4399", self.user_id)
+        get_sauth.assert_awaited_once_with("global-user-openid")
+        record_usage.assert_called_once_with("4399", "global-user-openid")
         self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
 
     async def test_restricted_nfa_does_not_call_upstream(self):

@@ -804,21 +804,23 @@ async def get_gateway_auth_header():
 
 # ====== 消息发送 ======
 _msg_seq_counter: dict[str, int] = {}
-_INBOUND_GROUP_MSG_CACHE_MAX = 1000
-_recent_group_msg_ids: OrderedDict[str, float] = OrderedDict()
+_INBOUND_MSG_CACHE_MAX = 1000
+_recent_inbound_msg_ids: OrderedDict[tuple[str, str, str], float] = OrderedDict()
 
 
-def _remember_group_message(group_openid: str, msg_id: str) -> bool:
+def _remember_inbound_message(
+    message_type: str, conversation_id: str, msg_id: str
+) -> bool:
     if not msg_id:
         return True
 
-    key = f"{group_openid}:{msg_id}"
-    if key in _recent_group_msg_ids:
+    key = (message_type, conversation_id, msg_id)
+    if key in _recent_inbound_msg_ids:
         return False
 
-    _recent_group_msg_ids[key] = _time_mod.time()
-    while len(_recent_group_msg_ids) > _INBOUND_GROUP_MSG_CACHE_MAX:
-        _recent_group_msg_ids.popitem(last=False)
+    _recent_inbound_msg_ids[key] = _time_mod.time()
+    while len(_recent_inbound_msg_ids) > _INBOUND_MSG_CACHE_MAX:
+        _recent_inbound_msg_ids.popitem(last=False)
     return True
 
 
@@ -1452,7 +1454,7 @@ async def handle_command(ctx, content):
         if not await _check_resource_restrict(ctx, "4399", limit_user_id):
             return True
 
-        success, result = await sauth.get_sauth()
+        success, result = await sauth.get_sauth(limit_user_id)
         if success:
             _record_resource_restrict("4399", limit_user_id)
             quota_text = _resource_success_quota_line("4399", limit_user_id)
@@ -1960,7 +1962,9 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         )
         return
 
-    if not _remember_group_message(event.group_openid, event.msg_id):
+    if not _remember_inbound_message(
+        event.type, event.group_openid, event.msg_id
+    ):
         _log.debug(
             f"[群消息去重] event={event.event_type} "
             f"group={event.group_openid} msg={event.msg_id}"
@@ -1979,6 +1983,12 @@ async def handle_c2c_message(data):
     if not event:
         return
 
+    if not _remember_inbound_message(event.type, event.user_openid, event.msg_id):
+        _log.debug(
+            f"[私聊去重] user={event.user_openid} msg={event.msg_id}"
+        )
+        return
+
     _log.info(f"[私聊] {event.user_openid[:8]}...: {event.content[:50]}")
     await process_message(event.to_ctx(), event.content)
 
@@ -1988,11 +1998,13 @@ async def handle_koishi_bridge_payload(payload: dict):
     if not event:
         return {"ok": True, "ignored": True}
 
-    if event.type == "group" and not _remember_group_message(
-        event.group_openid, event.msg_id
-    ):
+    conversation_id = (
+        event.group_openid if event.type == "group" else event.user_openid
+    )
+    if not _remember_inbound_message(event.type, conversation_id, event.msg_id):
         _log.debug(
-            f"[KoishiBridge去重] group={event.group_openid} msg={event.msg_id}"
+            f"[KoishiBridge去重] type={event.type} "
+            f"conversation={conversation_id} msg={event.msg_id}"
         )
         return {"ok": True, "ignored": True, "reason": "duplicate"}
 
