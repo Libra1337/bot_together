@@ -167,21 +167,44 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         ) as require_email, patch.object(
             bot, "_check_resource_restrict", new_callable=AsyncMock
         ) as check_restrict, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             require_email.return_value = False
             check_restrict.return_value = True
-            get_sauth.return_value = (True, "token")
+            get_credentials.return_value = (True, "account: demo\npassword: secret")
             send_result.return_value = True
 
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
         require_email.assert_not_awaited()
-        get_sauth.assert_awaited_once()
+        get_credentials.assert_awaited_once()
         send_result.assert_awaited_once()
+
+    async def test_sauth_command_only_fetches_sauth(self):
+        with patch.object(
+            bot, "_check_resource_restrict", new_callable=AsyncMock
+        ) as check_restrict, patch.object(
+            bot.sauth, "get_sauth", new_callable=AsyncMock
+        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
+            bot, "_send_resource_result", new_callable=AsyncMock
+        ) as send_result:
+            check_restrict.return_value = True
+            get_sauth.return_value = (True, "Sauth: token-only")
+            send_result.return_value = True
+
+            handled = await bot.handle_command(self.ctx, "/sauth")
+
+        self.assertTrue(handled)
+        get_sauth.assert_awaited_once()
+        get_credentials.assert_not_awaited()
+        send_result.assert_awaited_once()
+        self.assertEqual(send_result.await_args.args[2], "sauth")
+        self.assertEqual(send_result.await_args.args[5], "Sauth: token-only")
 
     async def test_group_resource_request_still_requires_bound_email(self):
         group_ctx = {
@@ -193,15 +216,15 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth:
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials:
             require_email.return_value = False
 
             handled = await bot.handle_command(group_ctx, "/4399")
 
         self.assertTrue(handled)
         require_email.assert_awaited_once_with(group_ctx, self.user_id)
-        get_sauth.assert_not_awaited()
+        get_credentials.assert_not_awaited()
 
     async def test_restricted_4399_does_not_call_upstream(self):
         with patch.object(
@@ -215,8 +238,8 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
                 "reset_after": 3661,
             },
         ), patch.object(bot, "_require_bound_email", new_callable=AsyncMock) as require_email, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
             bot, "reply", new_callable=AsyncMock
         ) as reply:
             require_email.return_value = True
@@ -224,7 +247,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
-        get_sauth.assert_not_awaited()
+        get_credentials.assert_not_awaited()
         reply.assert_awaited_once_with(
             self.ctx,
             "已达到获取上限\n当前获取：1/1\n限额刷新：1h1min1s",
@@ -241,12 +264,12 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(bot._state_backend, "record_resource_usage") as record_usage, patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             require_email.return_value = True
-            get_sauth.return_value = (True, "token")
+            get_credentials.return_value = (True, "account: demo\npassword: secret")
             send_result.return_value = True
 
             handled = await bot.handle_command(self.ctx, "/4399")
@@ -266,14 +289,14 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             bot, "_check_resource_restrict", new_callable=AsyncMock
         ) as check_restrict, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
             bot._state_backend, "record_resource_usage"
         ) as record_usage, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             check_restrict.return_value = True
-            get_sauth.side_effect = slow_get_sauth
+            get_credentials.side_effect = slow_get_sauth
             send_result.return_value = True
 
             handled = await asyncio.gather(
@@ -282,7 +305,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(handled, [True, True])
-        get_sauth.assert_awaited_once()
+        get_credentials.assert_awaited_once()
         record_usage.assert_called_once_with("4399", self.user_id)
         send_result.assert_awaited_once()
 
@@ -304,15 +327,15 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         ) as require_email, patch.object(
             bot, "_check_resource_restrict", new_callable=AsyncMock
         ) as check_restrict, patch.object(
-            bot.sauth, "get_sauth", new_callable=AsyncMock
-        ) as get_sauth, patch.object(
+            bot.sauth, "get_4399_credentials", new_callable=AsyncMock
+        ) as get_credentials, patch.object(
             bot._state_backend, "record_resource_usage"
         ) as record_usage, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             require_email.return_value = True
             check_restrict.return_value = True
-            get_sauth.side_effect = slow_get_sauth
+            get_credentials.side_effect = slow_get_sauth
             send_result.return_value = True
 
             handled = await asyncio.gather(
@@ -321,7 +344,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(handled, [True, True])
-        self.assertEqual(get_sauth.await_count, 2)
+        self.assertEqual(get_credentials.await_count, 2)
         self.assertEqual(record_usage.call_count, 2)
         self.assertEqual(send_result.await_count, 2)
         sent_contexts = [call.args[0] for call in send_result.await_args_list]

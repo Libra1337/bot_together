@@ -12,6 +12,7 @@ import httpx
 _log = logging.getLogger("QQBot")
 
 SAUTH_API = "https://cookie.meowow.org/api/accounts/sauth/quick"
+ACCOUNT_4399_API = "https://cookie.meowow.org/api/accounts/credentials/quick"
 ACCOUNT_163_API = "https://cookie.meowow.org/api/accounts/163/credentials/quick"
 ACCOUNT_163_INVENTORY_API = "https://cookie.meowow.org/api/admin/163/inventory"
 SAUTH_API_KEY = "f1856856cc9f4640be12ef0153235df1"
@@ -78,15 +79,10 @@ async def get_sauth() -> tuple[bool, str]:
                     password_value = data.get("password", "")
                     sauth_value = data.get("Sauth", "")
 
-                    if not account_value or not password_value or not sauth_value:
+                    if not sauth_value:
                         return False, "4399 sauth 获取失败喵：返回数据为空"
 
-                    result = (
-                        "Ciallo～(∠・ω< )⌒★主人您要的东西来啦~\n"
-                        f"账号：{account_value}\n"
-                        f"密码：{password_value}\n"
-                        f"sauth：{sauth_value}"
-                    )
+                    result = f"4399 Sauth：{sauth_value}"
                     return True, result
 
                 # 5xx 服务端错误 → 重试
@@ -110,6 +106,73 @@ async def get_sauth() -> tuple[bool, str]:
         except Exception as e:
             _log.error(f"4399 sauth 获取失败: {e}")
             return False, "4399 sauth 获取失败了喵，请稍后再试~"
+
+
+async def get_4399_credentials() -> tuple[bool, str]:
+    """获取 4399 账号密码，不转换或返回 Sauth。"""
+    async with _semaphore:
+        last_status = 0
+        try:
+            client = _get_client()
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = await client.post(
+                        ACCOUNT_4399_API,
+                        headers={"X-Api-Key": SAUTH_API_KEY},
+                    )
+                except httpx.ConnectError as e:
+                    _log.warning(f"[4399] 第 {attempt + 1} 次连接失败: {e}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, "4399 账号获取失败喵：连接服务器失败"
+                except httpx.TimeoutException:
+                    _log.warning(f"[4399] 第 {attempt + 1} 次请求超时")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        continue
+                    return False, "4399 账号获取失败喵：请求超时"
+
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data.get("data"), dict):
+                        data = data["data"]
+                    account_value = str(
+                        data.get("account") or data.get("username") or data.get("user") or ""
+                    ).strip()
+                    password_value = str(
+                        data.get("password") or data.get("pwd") or data.get("pass") or ""
+                    ).strip()
+                    if not account_value or not password_value:
+                        return False, "4399 账号获取失败喵：返回账号密码为空"
+
+                    return True, (
+                        "主人您的4399账号来了喵~\n"
+                        "━━━━━━━━━━━━━━\n"
+                        f"账号：{account_value}\n"
+                        f"密码：{password_value}\n"
+                        "━━━━━━━━━━━━━━\n"
+                        "爱来自Miracle小号网站"
+                    )
+
+                if resp.status_code >= 500:
+                    delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                    _log.warning(
+                        f"[4399] 第 {attempt + 1} 次请求失败 HTTP {resp.status_code}，{delay}s 后重试"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                return False, f"4399 账号获取失败喵：HTTP {resp.status_code}"
+
+            return (
+                False,
+                f"4399 账号获取失败喵：HTTP {last_status}（已重试 {MAX_RETRIES} 次）",
+            )
+        except Exception as e:
+            _log.error(f"4399 账号获取失败: {e}")
+            return False, "4399 账号获取失败了喵，请稍后再试~"
 
 
 # ─── 4399 库存查询 ───────────────────────────────────────────────

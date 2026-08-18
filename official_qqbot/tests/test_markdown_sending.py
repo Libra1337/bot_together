@@ -77,7 +77,7 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["markdown"]["content"], "## 标题\n正文")
         self.assertEqual(payload["msg_id"], "msg-a")
         rows = payload["keyboard"]["content"]["rows"]
-        self.assertEqual([len(row["buttons"]) for row in rows], [2, 2])
+        self.assertEqual([len(row["buttons"]) for row in rows], [3, 2])
 
     async def test_markdown_message_does_not_append_ads(self):
         _CaptureClient.responses = [_Response(200, "ok")]
@@ -105,7 +105,7 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         payload = _CaptureClient.calls[0]["json"]
         rows = payload["keyboard"]["content"]["rows"]
-        self.assertEqual([len(row["buttons"]) for row in rows], [2, 2])
+        self.assertEqual([len(row["buttons"]) for row in rows], [3, 2])
         buttons = [
             button
             for row in rows
@@ -113,15 +113,15 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             [button["render_data"]["label"] for button in buttons],
-            ["获取4399", "获取163", "查询库存", "快捷绑定"],
+            ["获取4399", "获取Sauth", "获取163", "查询库存", "快捷绑定"],
         )
         self.assertEqual(
             [button["action"]["data"] for button in buttons],
-            ["/4399", "/163", "/查库存", "/bind"],
+            ["/4399", "/sauth", "/163", "/查库存", "/bind"],
         )
         self.assertEqual(
             [button["render_data"]["style"] for button in buttons],
-            [1, 1, 1, 1],
+            [1, 1, 1, 1, 1],
         )
 
     async def test_group_message_falls_back_to_text_when_markdown_fails(self):

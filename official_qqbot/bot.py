@@ -591,6 +591,7 @@ _KNOWN_COMMANDS = {
     "清空对话",
     "nfa",
     "4399",
+    "sauth",
     "163",
     "stock",
     "bind",
@@ -610,6 +611,7 @@ _KNOWN_COMMANDS = {
     "来首歌",
     "/nfa",
     "/4399",
+    "/sauth",
     "/163",
     "/stock",
     "/bind",
@@ -625,7 +627,8 @@ _KNOWN_COMMANDS = {
 }
 _FUZZY_SPECS = [
     ("nfa", "获取 NFA Token"),
-    ("4399", "获取 4399 Sauth"),
+    ("4399", "获取 4399 账号密码"),
+    ("sauth", "只获取 4399 Sauth"),
     ("163", "领取 163 小号"),
     ("stock", "查看全部库存"),
     ("/bind", "绑定资源接收邮箱"),
@@ -989,6 +992,7 @@ def _default_resource_keyboard() -> dict:
         [
             [
                 _command_button("quick_4399", "获取4399", "/4399", 1),
+                _command_button("quick_sauth", "获取Sauth", "/sauth", 1),
                 _command_button("quick_163", "获取163", "/163", 1),
             ],
             [
@@ -1197,7 +1201,8 @@ async def handle_command(ctx, content):
                 "搜索GitHub 关键词 — 搜索仓库\n"
                 "━━━ 小号/资源 ━━━\n"
                 "nfa — 获取 NFA Token\n"
-                "4399 — 获取 4399 Sauth\n"
+                "4399 — 获取 4399 账号密码\n"
+                "sauth — 只获取 4399 Sauth\n"
                 "163 — 领取 163 小号\n"
                 "stock — 查看全部库存\n"
                 "/bind 邮箱/QQ号 — 绑定资源接收地址（群聊领取前必需）\n"
@@ -1525,7 +1530,7 @@ async def handle_command(ctx, content):
             _log.info(f"[ResourceDedup] 4399 busy user={limit_user_id[:8]}...")
             return True
 
-        success, result = await sauth.get_sauth()
+        success, result = await sauth.get_4399_credentials()
         if success:
             _record_resource_restrict("4399", limit_user_id)
             quota_text = _resource_success_quota_line("4399", limit_user_id)
@@ -1534,6 +1539,36 @@ async def handle_command(ctx, content):
                 ctx,
                 user_id,
                 "4399",
+                "4399 账号",
+                "Miracle 4399 账号密码",
+                result,
+                quota_text=quota_text,
+            )
+        else:
+            await reply(ctx, result)
+        _log.info(f"[4399] {user_id[:8]}...")
+        _end_resource_request("4399", limit_user_id, ctx)
+        return True
+
+    # sauth
+    if lower in ("sauth", "/sauth"):
+        if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
+            return True
+        if not await _check_resource_restrict(ctx, "4399", limit_user_id):
+            return True
+
+        if not _begin_resource_request("4399", limit_user_id, ctx):
+            _log.info(f"[ResourceDedup] sauth busy user={limit_user_id[:8]}...")
+            return True
+
+        success, result = await sauth.get_sauth()
+        if success:
+            _record_resource_restrict("4399", limit_user_id)
+            quota_text = _resource_success_quota_line("4399", limit_user_id)
+            await _send_resource_result(
+                ctx,
+                user_id,
+                "sauth",
                 "4399 Sauth",
                 "Miracle 4399 Sauth",
                 result,
@@ -1541,7 +1576,7 @@ async def handle_command(ctx, content):
             )
         else:
             await reply(ctx, result)
-        _log.info(f"[4399] {user_id[:8]}...")
+        _log.info(f"[Sauth] {user_id[:8]}...")
         _end_resource_request("4399", limit_user_id, ctx)
         return True
 
