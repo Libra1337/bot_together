@@ -12,6 +12,7 @@ import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from .ai_config import AIConfigManager, AISettings
 from .auth import require_admin_token, require_bot_token
 from .db import create_app_engine, init_db
 from .schemas import (
@@ -30,13 +31,22 @@ from .service import ControlService
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
-def create_app(database_url: str, bot_token: str, admin_token: str) -> FastAPI:
+def create_app(
+    database_url: str,
+    bot_token: str,
+    admin_token: str,
+    config_path: str | Path | None = None,
+) -> FastAPI:
     engine = create_app_engine(database_url)
     init_db(engine)
     service = ControlService(engine)
     app = FastAPI(title="Official QQBot Control API")
     app.state.engine = engine
     app.state.control_service = service
+    resolved_config_path = config_path or os.getenv("BOT_CONFIG_PATH", "")
+    if not resolved_config_path:
+        resolved_config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    app.state.ai_config_manager = AIConfigManager(resolved_config_path)
 
     bot_guard = Depends(require_bot_token(bot_token))
     admin_guard = Depends(require_admin_token(admin_token))
@@ -297,6 +307,93 @@ def create_app(database_url: str, bot_token: str, admin_token: str) -> FastAPI:
             return auth
         return HTMLResponse(_settings_page(service))
 
+    @app.get("/dashboard/ai", response_class=HTMLResponse)
+    def dashboard_ai(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        return HTMLResponse(_ai_page(app.state.ai_config_manager))
+
+    @app.post("/dashboard/ai/test", response_class=HTMLResponse)
+    async def dashboard_ai_test(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        manager = app.state.ai_config_manager
+        form = await _read_urlencoded_form(request)
+        settings = _ai_settings_from_form(manager, form)
+        ok, message = await manager.check(settings)
+        return HTMLResponse(
+            _ai_page(
+                manager,
+                notice=message if ok else "",
+                error="" if ok else message,
+                base_url=settings.base_url,
+                model=settings.model,
+            ),
+            status_code=200 if ok else 400,
+        )
+
+    @app.post("/dashboard/ai/save", response_class=HTMLResponse)
+    async def dashboard_ai_save(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        manager = app.state.ai_config_manager
+        form = await _read_urlencoded_form(request)
+        settings = _ai_settings_from_form(manager, form)
+        ok, message = await manager.check(settings)
+        if not ok:
+            return HTMLResponse(
+                _ai_page(
+                    manager,
+                    error=message,
+                    base_url=settings.base_url,
+                    model=settings.model,
+                ),
+                status_code=400,
+            )
+
+        try:
+            snapshot = manager.save(settings)
+        except (OSError, ValueError):
+            return HTMLResponse(
+                _ai_page(
+                    manager,
+                    error="配置保存失败，请检查配置文件权限",
+                    base_url=settings.base_url,
+                    model=settings.model,
+                ),
+                status_code=500,
+            )
+        restarted, restart_message = manager.restart_bot()
+        if not restarted:
+            manager.restore(snapshot)
+            manager.restart_bot()
+            return HTMLResponse(
+                _ai_page(
+                    manager,
+                    error=restart_message,
+                    base_url=manager.load().base_url,
+                    model=manager.load().model,
+                ),
+                status_code=503,
+            )
+
+        service.log_audit(
+            "ai_config_update",
+            actor_user_key="dashboard",
+            detail=f"base_url={settings.base_url}; model={settings.model}",
+        )
+        return HTMLResponse(
+            _ai_page(
+                manager,
+                notice=restart_message,
+                base_url=settings.base_url,
+                model=settings.model,
+            )
+        )
+
     @app.post("/dashboard/ads")
     async def dashboard_create_ad(request: Request):
         auth = _dashboard_auth_redirect(request, dashboard_secret)
@@ -495,6 +592,74 @@ def _dashboard_auth_redirect(request: Request, secret: str):
     if not _dashboard_authenticated(request, secret):
         return RedirectResponse("/dashboard/login", status_code=303)
     return None
+
+
+def _ai_settings_from_form(manager: AIConfigManager, form: dict[str, str]) -> AISettings:
+    current = manager.load()
+    return AISettings(
+        base_url=str(form.get("base_url", "")).strip() or current.base_url,
+        model=str(form.get("model", "")).strip() or current.model,
+        api_key=str(form.get("api_key", "")).strip() or current.api_key,
+    )
+
+
+def _ai_page(
+    manager: AIConfigManager,
+    *,
+    notice: str = "",
+    error: str = "",
+    base_url: str = "",
+    model: str = "",
+) -> str:
+    public = manager.public_settings()
+    visible_base_url = base_url or str(public["base_url"])
+    visible_model = model or str(public["model"])
+    key_status = (
+        f"已配置：{public['api_key_masked']}"
+        if public["api_key_configured"]
+        else "尚未配置"
+    )
+    notice_html = (
+        f"<div class='notice success' role='status' aria-live='polite'>{html.escape(notice)}</div>"
+        if notice
+        else ""
+    )
+    error_html = (
+        f"<div class='notice error' role='alert' aria-live='assertive'>{html.escape(error)}</div>"
+        if error
+        else ""
+    )
+    body = f"""
+    <section class="grid ai-page">
+      <div class="panel span-2">
+        <div class="panel-head"><h2>AI 对话配置</h2><span>仅管理员可修改，保存后立即重启 Bot</span></div>
+        {notice_html}{error_html}
+        <form class="stack-form ai-form" method="post" action="/dashboard/ai/test">
+          <label for="ai-base-url">API 地址</label>
+          <input id="ai-base-url" name="base_url" type="url" value="{html.escape(visible_base_url)}" required>
+          <p class="field-note">填写 OpenAI 兼容接口的 v1 地址，例如 https://example.com/v1</p>
+          <label for="ai-api-key">API Key</label>
+          <input id="ai-api-key" name="api_key" type="password" autocomplete="new-password" placeholder="留空保持当前 Key">
+          <p class="field-note">当前状态：{html.escape(key_status)}；页面不会回显完整 Key</p>
+          <label for="ai-model">模型名称</label>
+          <input id="ai-model" name="model" value="{html.escape(visible_model)}" required>
+          <div class="actions ai-actions">
+            <button type="submit" class="ghost">检测连接</button>
+            <button type="submit" formaction="/dashboard/ai/save">保存并重启</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel span-2 ai-guide">
+        <div class="panel-head"><h2>生效规则</h2><span>变更可追溯</span></div>
+        <div class="settings-list">
+          <div><span>检测连接</span><strong>只检测，不修改当前配置</strong></div>
+          <div><span>保存并重启</span><strong>检测通过后更新配置并重启 official-qqbot</strong></div>
+          <div><span>重启失败</span><strong>自动恢复旧配置，不重启控制台</strong></div>
+        </div>
+      </div>
+    </section>
+    """
+    return _layout("AI 对话", "ai", body)
 
 
 def _login_html(error: str = "") -> str:
@@ -699,6 +864,7 @@ def _layout(title: str, active: str, body: str) -> str:
       {_nav_link("limits", "/dashboard/limits", "获取限制", active)}
       {_nav_link("logs", "/dashboard/logs", "日志审计", active)}
       {_nav_link("settings", "/dashboard/settings", "系统设置", active)}
+      {_nav_link("ai", "/dashboard/ai", "AI 对话", active)}
     </nav>
   </aside>
   <main class="console">
@@ -1359,6 +1525,13 @@ code { font-family: Consolas, monospace; font-size: 12px; }
 .settings-list div { display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid #eeeae2; padding-bottom: 10px; }
 .settings-list span { color: #666; }
 .settings-list strong { text-align: right; overflow-wrap: anywhere; }
+.field-note { color: #64748b; font-size: 12px; line-height: 1.5; margin-top: -4px; }
+.ai-actions { justify-content: flex-end; margin-top: 8px; }
+.ai-actions button { min-width: 118px; height: 44px; }
+.notice { border-radius: 8px; padding: 11px 13px; margin-bottom: 12px; font-weight: 700; line-height: 1.5; }
+.notice.success { border: 1px solid #bbf7d0; background: #f0fdf4; color: #166534; }
+.notice.error { border: 1px solid #fecaca; background: #fef2f2; color: #991b1b; }
+.ai-guide { background: linear-gradient(135deg, #fff 0%, #eff6ff 100%); }
 .login-body { min-height: 100vh; display: grid; place-items: center; }
 .login-panel { width: min(380px, calc(100vw - 32px)); border: 1px solid #ddd8ce; border-radius: 8px; background: #fff; padding: 28px; animation: consoleEnter .32s ease-out both; }
 .brand-line { color: #777; font-size: 12px; font-weight: 800; margin-bottom: 14px; }
@@ -1387,6 +1560,17 @@ code { font-family: Consolas, monospace; font-size: 12px; }
 
 _DASHBOARD_JS = """
 document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.ai-form').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      const submitter = event.submitter;
+      if (!submitter) return;
+      form.querySelectorAll('button[type="submit"]').forEach((button) => {
+        button.disabled = true;
+      });
+      submitter.textContent = submitter.formAction.endsWith('/save') ? '正在保存并重启…' : '正在检测…';
+    });
+  });
+
   const activateHotspot = (target, selector) => {
     document.querySelectorAll(selector + '.is-active').forEach((item) => {
       if (item !== target) item.classList.remove('is-active');

@@ -2,6 +2,9 @@ import tempfile
 import unittest
 import os
 import json
+from unittest.mock import AsyncMock, patch
+
+import yaml
 
 from fastapi.testclient import TestClient
 
@@ -13,10 +16,26 @@ class DashboardAppTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_local_state_dir = os.environ.get("LOCAL_STATE_DIR")
         os.environ["LOCAL_STATE_DIR"] = self.tmp.name
+        self.config_path = os.path.join(self.tmp.name, "config.yaml")
+        with open(self.config_path, "w", encoding="utf-8") as config_file:
+            yaml.safe_dump(
+                {
+                    "bot": {"app_id": "app-1"},
+                    "ai": {
+                        "base_url": "https://api.example.test/v1",
+                        "api_key": "sk-full-secret",
+                        "model": "model-a",
+                    },
+                },
+                config_file,
+                allow_unicode=True,
+                sort_keys=False,
+            )
         self.app = create_app(
             database_url=f"sqlite:///{self.tmp.name}/control.db",
             bot_token="bot-token",
             admin_token="admin-token",
+            config_path=self.config_path,
         )
         self.client = TestClient(self.app)
 
@@ -31,6 +50,126 @@ class DashboardAppTests(unittest.TestCase):
         resp = self.client.get("/dashboard", follow_redirects=False)
         self.assertEqual(resp.status_code, 303)
         self.assertEqual(resp.headers["location"], "/dashboard/login")
+
+    def _login(self):
+        self.client.post(
+            "/dashboard/login",
+            content="token=admin-token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def test_ai_dashboard_requires_login(self):
+        resp = self.client.get("/dashboard/ai", follow_redirects=False)
+
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/dashboard/login")
+
+    def test_ai_dashboard_contains_chinese_form_and_masked_key_after_login(self):
+        self._login()
+
+        resp = self.client.get("/dashboard/ai")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("AI 对话", resp.text)
+        self.assertIn("检测连接", resp.text)
+        self.assertIn("保存并重启", resp.text)
+        self.assertIn("sk-***cret", resp.text)
+        self.assertNotIn("sk-full-secret", resp.text)
+
+    def test_ai_test_route_does_not_save_config(self):
+        self._login()
+        manager = self.app.state.ai_config_manager
+        form = {
+            "base_url": "https://api.example.test/v2",
+            "api_key": "new-secret",
+            "model": "model-b",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(return_value=(True, "连接成功")),
+        ), patch.object(manager, "save") as save:
+            resp = self.client.post("/dashboard/ai/test", data=form)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("连接成功", resp.text)
+        save.assert_not_called()
+
+    def test_ai_save_route_checks_restarts_and_audits(self):
+        self._login()
+        manager = self.app.state.ai_config_manager
+        form = {
+            "base_url": "https://api.example.test/v2",
+            "api_key": "new-secret",
+            "model": "model-b",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(return_value=(True, "连接成功")),
+        ), patch.object(manager, "save", return_value=b"old"), patch.object(
+            manager,
+            "restart_bot",
+            return_value=(True, "Bot 已重启并使用新配置"),
+        ):
+            resp = self.client.post("/dashboard/ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Bot 已重启并使用新配置", resp.text)
+        self.assertTrue(
+            any(
+                item["action"] == "ai_config_update"
+                for item in self.app.state.control_service.list_audit_logs()
+            )
+        )
+
+    def test_ai_save_route_restores_when_restart_fails(self):
+        self._login()
+        manager = self.app.state.ai_config_manager
+        form = {
+            "base_url": "https://api.example.test/v2",
+            "api_key": "new-secret",
+            "model": "model-b",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(return_value=(True, "连接成功")),
+        ), patch.object(manager, "save", return_value=b"old"), patch.object(
+            manager,
+            "restore",
+        ) as restore, patch.object(
+            manager,
+            "restart_bot",
+            return_value=(False, "Bot 重启失败"),
+        ):
+            resp = self.client.post("/dashboard/ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("Bot 重启失败", resp.text)
+        restore.assert_called_once_with(b"old")
+
+    def test_ai_save_route_reports_config_write_failure(self):
+        self._login()
+        manager = self.app.state.ai_config_manager
+        form = {
+            "base_url": "https://api.example.test/v2",
+            "api_key": "new-secret",
+            "model": "model-b",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(return_value=(True, "连接成功")),
+        ), patch.object(manager, "save", side_effect=OSError("read only")):
+            resp = self.client.post("/dashboard/ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 500)
+        self.assertIn("配置保存失败", resp.text)
 
     def test_dashboard_login_sets_session_cookie(self):
         resp = self.client.post(
