@@ -30,6 +30,25 @@ class ConfigEnvTests(unittest.TestCase):
             if old_value is not None:
                 os.environ["QQ_APP_SECRET"] = old_value
 
+    def test_ai_config_value_prefers_dashboard_config_over_environment(self):
+        old_value = os.environ.get("AI_MODEL")
+        os.environ["AI_MODEL"] = "env-model"
+        try:
+            self.assertEqual(
+                bot._ai_config_value(
+                    {"model": "dashboard-model"},
+                    "model",
+                    "AI_MODEL",
+                    "default-model",
+                ),
+                "dashboard-model",
+            )
+        finally:
+            if old_value is None:
+                os.environ.pop("AI_MODEL", None)
+            else:
+                os.environ["AI_MODEL"] = old_value
+
     def test_bool_env_zero_overrides_config_true(self):
         old_value = os.environ.get("QQ_OFFICIAL_WS_ENABLED")
         os.environ["QQ_OFFICIAL_WS_ENABLED"] = "0"

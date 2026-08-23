@@ -77,6 +77,13 @@ def _config_value(section: dict, key: str, env_name: str | None = None, default=
     return section.get(key, default)
 
 
+def _ai_config_value(section: dict, key: str, env_name: str | None = None, default=None):
+    config_value = section.get(key)
+    if config_value is not None and str(config_value).strip():
+        return str(config_value).strip()
+    return _config_value(section, key, env_name, default)
+
+
 def _config_bool(
     section: dict, key: str, env_name: str | None = None, default: bool = False
 ) -> bool:
@@ -124,11 +131,11 @@ BOT_CONTROL_TOKEN = str(
     _config_value(CONTROL_CONFIG, "bot_token", "BOT_CONTROL_TOKEN", "") or ""
 )
 AI_BASE_URL = str(
-    _config_value(AI_CONFIG, "base_url", "AI_BASE_URL", "https://fisx-ai.guimc.ltd/v1")
+    _ai_config_value(AI_CONFIG, "base_url", "AI_BASE_URL", "https://fisx-ai.guimc.ltd/v1")
     or ""
 )
-AI_API_KEY = str(_config_value(AI_CONFIG, "api_key", "AI_API_KEY", "") or "")
-AI_MODEL = str(_config_value(AI_CONFIG, "model", "AI_MODEL", "deepseek-v4-flash") or "")
+AI_API_KEY = str(_ai_config_value(AI_CONFIG, "api_key", "AI_API_KEY", "") or "")
+AI_MODEL = str(_ai_config_value(AI_CONFIG, "model", "AI_MODEL", "deepseek-v4-flash") or "")
 AI_CONFIG["base_url"] = AI_BASE_URL
 AI_CONFIG["api_key"] = AI_API_KEY
 AI_CONFIG["model"] = AI_MODEL
