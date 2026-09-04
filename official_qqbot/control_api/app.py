@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .ai_config import AIConfigManager, AISettings
 from .auth import require_admin_token, require_bot_token
 from .db import create_app_engine, init_db
+from .image_ai_config import IMAGE_SIZES, ImageAIConfigManager, ImageAISettings
 from .schemas import (
     BanRequest,
     CommandLogRequest,
@@ -47,6 +48,7 @@ def create_app(
     if not resolved_config_path:
         resolved_config_path = Path(__file__).resolve().parent.parent / "config.yaml"
     app.state.ai_config_manager = AIConfigManager(resolved_config_path)
+    app.state.image_ai_config_manager = ImageAIConfigManager(resolved_config_path)
 
     bot_guard = Depends(require_bot_token(bot_token))
     admin_guard = Depends(require_admin_token(admin_token))
@@ -394,6 +396,108 @@ def create_app(
             )
         )
 
+    @app.get("/dashboard/image-ai", response_class=HTMLResponse)
+    def dashboard_image_ai(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        return HTMLResponse(_image_ai_page(app.state.image_ai_config_manager))
+
+    @app.post("/dashboard/image-ai/test", response_class=HTMLResponse)
+    async def dashboard_image_ai_test(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        manager = app.state.image_ai_config_manager
+        form = await _read_urlencoded_form(request)
+        settings = _image_ai_settings_from_form(manager, form)
+        ok, message, preview = await manager.check(settings)
+        return HTMLResponse(
+            _image_ai_page(
+                manager,
+                notice=message if ok else "",
+                error="" if ok else message,
+                settings=settings,
+                preview=preview,
+            ),
+            status_code=200 if ok else 400,
+        )
+
+    @app.post("/dashboard/image-ai/save", response_class=HTMLResponse)
+    async def dashboard_image_ai_save(request: Request):
+        auth = _dashboard_auth_redirect(request, dashboard_secret)
+        if auth:
+            return auth
+        manager = app.state.image_ai_config_manager
+        form = await _read_urlencoded_form(request)
+        settings = _image_ai_settings_from_form(manager, form)
+        preview = None
+        if settings.enabled:
+            ok, message, preview = await manager.check(settings)
+            if not ok:
+                return HTMLResponse(
+                    _image_ai_page(
+                        manager,
+                        error=message,
+                        settings=settings,
+                    ),
+                    status_code=400,
+                )
+        else:
+            validation_error = manager.validate(settings)
+            if validation_error:
+                return HTMLResponse(
+                    _image_ai_page(
+                        manager,
+                        error=validation_error,
+                        settings=settings,
+                    ),
+                    status_code=400,
+                )
+
+        try:
+            snapshot = manager.save(settings)
+        except (OSError, ValueError):
+            return HTMLResponse(
+                _image_ai_page(
+                    manager,
+                    error="配置保存失败，请检查配置文件权限",
+                    settings=settings,
+                ),
+                status_code=500,
+            )
+
+        restarted, restart_message = manager.restart_bot()
+        if not restarted:
+            manager.restore(snapshot)
+            manager.restart_bot()
+            return HTMLResponse(
+                _image_ai_page(
+                    manager,
+                    error=restart_message,
+                    settings=manager.load(),
+                ),
+                status_code=503,
+            )
+
+        service.log_audit(
+            "image_ai_config_update",
+            actor_user_key="dashboard",
+            detail=(
+                f"enabled={settings.enabled}; base_url={settings.base_url}; "
+                f"model={settings.model}; size={settings.size}; "
+                f"cooldown_seconds={settings.cooldown_seconds}"
+            ),
+        )
+        return HTMLResponse(
+            _image_ai_page(
+                manager,
+                notice=restart_message,
+                settings=settings,
+                preview=preview,
+            )
+        )
+
     @app.post("/dashboard/ads")
     async def dashboard_create_ad(request: Request):
         auth = _dashboard_auth_redirect(request, dashboard_secret)
@@ -603,6 +707,26 @@ def _ai_settings_from_form(manager: AIConfigManager, form: dict[str, str]) -> AI
     )
 
 
+def _image_ai_settings_from_form(
+    manager: ImageAIConfigManager, form: dict[str, str]
+) -> ImageAISettings:
+    current = manager.load()
+    try:
+        cooldown_seconds = int(
+            str(form.get("cooldown_seconds", current.cooldown_seconds)).strip()
+        )
+    except (TypeError, ValueError):
+        cooldown_seconds = -1
+    return ImageAISettings(
+        enabled=form.get("enabled", "") == "1",
+        base_url=str(form.get("base_url", "")).strip() or current.base_url,
+        model=str(form.get("model", "")).strip() or current.model,
+        api_key=str(form.get("api_key", "")).strip() or current.api_key,
+        size=str(form.get("size", "")).strip() or current.size,
+        cooldown_seconds=cooldown_seconds,
+    )
+
+
 def _ai_page(
     manager: AIConfigManager,
     *,
@@ -660,6 +784,103 @@ def _ai_page(
     </section>
     """
     return _layout("AI 对话", "ai", body)
+
+
+def _image_ai_page(
+    manager: ImageAIConfigManager,
+    *,
+    notice: str = "",
+    error: str = "",
+    settings: ImageAISettings | None = None,
+    preview=None,
+) -> str:
+    public = manager.public_settings()
+    current = settings or manager.load()
+    key_status = (
+        f"已配置：{public['api_key_masked']}"
+        if public["api_key_configured"]
+        else "尚未配置"
+    )
+    notice_html = (
+        f"<div class='notice success' role='status' aria-live='polite'>{html.escape(notice)}</div>"
+        if notice
+        else ""
+    )
+    error_html = (
+        f"<div class='notice error' role='alert' aria-live='assertive'>{html.escape(error)}</div>"
+        if error
+        else ""
+    )
+    checked = " checked" if current.enabled else ""
+    size_options = "".join(
+        f'<option value="{html.escape(size)}"'
+        f'{" selected" if size == current.size else ""}>{html.escape(size)}</option>'
+        for size in IMAGE_SIZES
+    )
+    preview_html = ""
+    if preview:
+        if getattr(preview, "url", ""):
+            preview_src = html.escape(str(preview.url), quote=True)
+        elif getattr(preview, "b64_json", ""):
+            preview_src = "data:image/png;base64," + html.escape(
+                str(preview.b64_json), quote=True
+            )
+        else:
+            preview_src = ""
+        if preview_src:
+            preview_html = f"""
+            <div class="image-ai-preview" aria-live="polite">
+              <span>检测结果</span>
+              <img src="{preview_src}" alt="AI 生图接口检测结果">
+            </div>"""
+
+    body = f"""
+    <section class="grid ai-page">
+      <div class="panel span-2">
+        <div class="panel-head"><h2>AI 生图配置</h2><span>独立于 AI 对话，保存后立即重启 Bot</span></div>
+        {notice_html}{error_html}
+        <form class="stack-form ai-form" method="post" action="/dashboard/image-ai/test">
+          <label class="toggle-field" for="image-ai-enabled">
+            <input id="image-ai-enabled" name="enabled" type="checkbox" value="1"{checked}>
+            <span><strong>启用 AI 生图</strong><small>关闭后生图请求不会调用外部接口</small></span>
+          </label>
+          <label for="image-ai-base-url">API 地址</label>
+          <input id="image-ai-base-url" name="base_url" type="url" value="{html.escape(current.base_url, quote=True)}" placeholder="https://example.com/v1">
+          <p class="field-note">填写 OpenAI 兼容接口的 v1 地址，系统请求 /images/generations</p>
+          <label for="image-ai-api-key">API Key</label>
+          <input id="image-ai-api-key" name="api_key" type="password" autocomplete="new-password" placeholder="留空保持当前 Key">
+          <p class="field-note">当前状态：{html.escape(key_status)}；页面不会回显完整 Key</p>
+          <label for="image-ai-model">生图模型</label>
+          <input id="image-ai-model" name="model" value="{html.escape(current.model, quote=True)}" placeholder="grok-imagine-1.0-fast">
+          <div class="form-grid-2">
+            <div>
+              <label for="image-ai-size">图片尺寸</label>
+              <select id="image-ai-size" name="size">{size_options}</select>
+            </div>
+            <div>
+              <label for="image-ai-cooldown">用户冷却（秒）</label>
+              <input id="image-ai-cooldown" name="cooldown_seconds" type="number" min="0" max="86400" value="{current.cooldown_seconds}" required>
+            </div>
+          </div>
+          <div class="actions ai-actions">
+            <button type="submit" class="ghost">检测生图</button>
+            <button type="submit" formaction="/dashboard/image-ai/save">保存并重启</button>
+          </div>
+        </form>
+        {preview_html}
+      </div>
+      <div class="panel span-2 ai-guide">
+        <div class="panel-head"><h2>生效规则</h2><span>群聊与私聊统一控制</span></div>
+        <div class="settings-list">
+          <div><span>触发方式</span><strong>/生图 描述，或“帮我画一张……”</strong></div>
+          <div><span>检测生图</span><strong>真实生成一张测试图，不保存配置</strong></div>
+          <div><span>用户冷却</span><strong>同一用户在群聊与私聊共用计时</strong></div>
+          <div><span>重启失败</span><strong>自动恢复旧配置，不重启控制台</strong></div>
+        </div>
+      </div>
+    </section>
+    """
+    return _layout("AI 生图", "image-ai", body)
 
 
 def _login_html(error: str = "") -> str:
@@ -865,6 +1086,7 @@ def _layout(title: str, active: str, body: str) -> str:
       {_nav_link("logs", "/dashboard/logs", "日志审计", active)}
       {_nav_link("settings", "/dashboard/settings", "系统设置", active)}
       {_nav_link("ai", "/dashboard/ai", "AI 对话", active)}
+      {_nav_link("image-ai", "/dashboard/image-ai", "AI 生图", active)}
     </nav>
   </aside>
   <main class="console">
@@ -1526,6 +1748,21 @@ code { font-family: Consolas, monospace; font-size: 12px; }
 .settings-list span { color: #666; }
 .settings-list strong { text-align: right; overflow-wrap: anywhere; }
 .field-note { color: #64748b; font-size: 12px; line-height: 1.5; margin-top: -4px; }
+.form-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.form-grid-2 > div { display: grid; gap: 8px; }
+.toggle-field { min-height: 58px; display: flex; align-items: center; gap: 12px; border: 1px solid #dbeafe; border-radius: 8px; background: #f8fbff; padding: 10px 12px; cursor: pointer; transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease; }
+.toggle-field:hover { border-color: #93c5fd; background: #eff6ff; box-shadow: 0 8px 18px rgba(37,99,235,.08); }
+.toggle-field input { appearance: none; position: relative; width: 44px; min-width: 44px; height: 24px; border: 0; border-radius: 999px; background: #cbd5e1; padding: 0; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(15,23,42,.08); transition: background-color .2s ease; }
+.toggle-field input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 2px 5px rgba(15,23,42,.2); transition: transform .2s ease; }
+.toggle-field input:checked { background: #2563eb; }
+.toggle-field input:checked::after { transform: translateX(20px); }
+.toggle-field input:focus-visible { outline: 3px solid rgba(37,99,235,.22); outline-offset: 2px; }
+.toggle-field span { display: grid; gap: 3px; }
+.toggle-field strong { color: #1f2937; font-size: 14px; }
+.toggle-field small { color: #64748b; font-size: 12px; line-height: 1.4; }
+.image-ai-preview { display: grid; gap: 10px; border-top: 1px solid #e5e7eb; margin-top: 20px; padding-top: 18px; }
+.image-ai-preview span { color: #475569; font-size: 13px; font-weight: 700; }
+.image-ai-preview img { display: block; width: min(100%, 420px); aspect-ratio: 1; object-fit: contain; border: 1px solid #dbeafe; border-radius: 8px; background: #f8fafc; }
 .ai-actions { justify-content: flex-end; margin-top: 8px; }
 .ai-actions button { min-width: 118px; height: 44px; }
 .notice { border-radius: 8px; padding: 11px 13px; margin-bottom: 12px; font-weight: 700; line-height: 1.5; }
@@ -1553,6 +1790,7 @@ code { font-family: Consolas, monospace; font-size: 12px; }
   .console { margin-left: 0; padding: 20px; }
   .page-head, .split, .grid, .metrics { grid-template-columns: 1fr; }
   .usage-grid { grid-template-columns: 1fr; }
+  .form-grid-2 { grid-template-columns: 1fr; }
   .span-2 { grid-column: auto; }
 }
 """

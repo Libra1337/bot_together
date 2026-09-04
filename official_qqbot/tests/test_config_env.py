@@ -49,6 +49,49 @@ class ConfigEnvTests(unittest.TestCase):
             else:
                 os.environ["AI_MODEL"] = old_value
 
+    def test_image_ai_config_value_prefers_dashboard_config_over_environment(self):
+        old_value = os.environ.get("IMAGE_AI_MODEL")
+        os.environ["IMAGE_AI_MODEL"] = "env-image-model"
+        try:
+            self.assertEqual(
+                bot._ai_config_value(
+                    {"model": "dashboard-image-model"},
+                    "model",
+                    "IMAGE_AI_MODEL",
+                    "default-image-model",
+                ),
+                "dashboard-image-model",
+            )
+        finally:
+            if old_value is None:
+                os.environ.pop("IMAGE_AI_MODEL", None)
+            else:
+                os.environ["IMAGE_AI_MODEL"] = old_value
+
+    def test_image_ai_config_value_falls_back_to_environment(self):
+        old_value = os.environ.get("IMAGE_AI_MODEL")
+        os.environ["IMAGE_AI_MODEL"] = "env-image-model"
+        try:
+            self.assertEqual(
+                bot._ai_config_value(
+                    {}, "model", "IMAGE_AI_MODEL", "default-image-model"
+                ),
+                "env-image-model",
+            )
+        finally:
+            if old_value is None:
+                os.environ.pop("IMAGE_AI_MODEL", None)
+            else:
+                os.environ["IMAGE_AI_MODEL"] = old_value
+
+    def test_ai_config_value_treats_non_mapping_section_as_empty(self):
+        self.assertEqual(
+            bot._ai_config_value(
+                "invalid-section", "model", None, "default-image-model"
+            ),
+            "default-image-model",
+        )
+
     def test_bool_env_zero_overrides_config_true(self):
         old_value = os.environ.get("QQ_OFFICIAL_WS_ENABLED")
         os.environ["QQ_OFFICIAL_WS_ENABLED"] = "0"

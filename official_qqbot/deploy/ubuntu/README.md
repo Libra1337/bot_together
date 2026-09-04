@@ -183,6 +183,25 @@ Dashboard pages:
 - `/dashboard/limits`: global 163/4399/nfa fetch limits
 - `/dashboard/logs`: command, outbound, and audit logs
 - `/dashboard/settings`: runtime and data source settings
+- `/dashboard/ai`: chat AI API, key, and model settings
+- `/dashboard/image-ai`: image generation API, key, model, size, and cooldown settings
+
+## AI Image Generation
+
+Configure image generation from `/dashboard/image-ai`. The page tests an OpenAI-compatible `POST /images/generations` request before saving and restarts only `official-qqbot` after a successful update. Values saved under `image_ai` in `config.yaml` take precedence over the optional `IMAGE_AI_*` environment fallbacks.
+
+Users can request one image with `/生图 description` or a natural phrase such as `帮我画一张雨夜里的重庆`. Group and private messages send the generated result through the QQ rich-media API and share the per-user cooldown.
+
+Optional environment fallbacks:
+
+```text
+IMAGE_AI_ENABLED=0
+IMAGE_AI_BASE_URL=https://example.com/v1
+IMAGE_AI_API_KEY=replace-with-image-ai-api-key
+IMAGE_AI_MODEL=grok-imagine-1.0-fast
+IMAGE_AI_SIZE=1024x1024
+IMAGE_AI_COOLDOWN_SECONDS=60
+```
 
 ## QQ Webhook Callback
 

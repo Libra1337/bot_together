@@ -9,6 +9,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from control_api.app import create_app
+from handlers.image_gen import GeneratedImage
 
 
 class DashboardAppTests(unittest.TestCase):
@@ -25,6 +26,14 @@ class DashboardAppTests(unittest.TestCase):
                         "base_url": "https://api.example.test/v1",
                         "api_key": "sk-full-secret",
                         "model": "model-a",
+                    },
+                    "image_ai": {
+                        "enabled": True,
+                        "base_url": "https://image.example.test/v1",
+                        "api_key": "ik-image-secret",
+                        "model": "image-model-a",
+                        "size": "1024x1024",
+                        "cooldown_seconds": 60,
                     },
                 },
                 config_file,
@@ -167,6 +176,180 @@ class DashboardAppTests(unittest.TestCase):
             new=AsyncMock(return_value=(True, "连接成功")),
         ), patch.object(manager, "save", side_effect=OSError("read only")):
             resp = self.client.post("/dashboard/ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 500)
+        self.assertIn("配置保存失败", resp.text)
+
+    def test_image_ai_dashboard_requires_login(self):
+        resp = self.client.get("/dashboard/image-ai", follow_redirects=False)
+
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/dashboard/login")
+
+    def test_image_ai_dashboard_contains_chinese_form(self):
+        self._login()
+
+        resp = self.client.get("/dashboard/image-ai")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("AI 生图", resp.text)
+        self.assertIn("API 地址", resp.text)
+        self.assertIn("生图模型", resp.text)
+        self.assertIn("图片尺寸", resp.text)
+        self.assertIn("用户冷却", resp.text)
+        self.assertIn("检测生图", resp.text)
+        self.assertIn("保存并重启", resp.text)
+        self.assertIn("ik-***cret", resp.text)
+        self.assertNotIn("ik-image-secret", resp.text)
+
+    def test_image_ai_test_route_previews_url_without_saving(self):
+        self._login()
+        manager = self.app.state.image_ai_config_manager
+        form = {
+            "enabled": "1",
+            "base_url": "https://new-image.example.test/v1",
+            "api_key": "new-image-key",
+            "model": "new-image-model",
+            "size": "1024x1024",
+            "cooldown_seconds": "90",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "生图连接成功",
+                    GeneratedImage(url="https://cdn.example.test/preview.png"),
+                )
+            ),
+        ), patch.object(manager, "save") as save:
+            resp = self.client.post("/dashboard/image-ai/test", data=form)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("生图连接成功", resp.text)
+        self.assertIn("https://cdn.example.test/preview.png", resp.text)
+        save.assert_not_called()
+
+    def test_image_ai_test_route_previews_base64(self):
+        self._login()
+        manager = self.app.state.image_ai_config_manager
+        form = {
+            "enabled": "1",
+            "base_url": "https://new-image.example.test/v1",
+            "api_key": "new-image-key",
+            "model": "new-image-model",
+            "size": "1024x1024",
+            "cooldown_seconds": "90",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(
+                return_value=(True, "生图连接成功", GeneratedImage(b64_json="YWJj"))
+            ),
+        ):
+            resp = self.client.post("/dashboard/image-ai/test", data=form)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("data:image/png;base64,YWJj", resp.text)
+
+    def test_image_ai_save_checks_restarts_and_audits_without_key(self):
+        self._login()
+        manager = self.app.state.image_ai_config_manager
+        form = {
+            "enabled": "1",
+            "base_url": "https://new-image.example.test/v1",
+            "api_key": "new-image-key",
+            "model": "new-image-model",
+            "size": "1536x1024",
+            "cooldown_seconds": "90",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "生图连接成功",
+                    GeneratedImage(url="https://cdn.example.test/preview.png"),
+                )
+            ),
+        ), patch.object(manager, "save", return_value=b"old"), patch.object(
+            manager,
+            "restart_bot",
+            return_value=(True, "Bot 已重启并使用新配置"),
+        ):
+            resp = self.client.post("/dashboard/image-ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Bot 已重启并使用新配置", resp.text)
+        logs = self.app.state.control_service.list_audit_logs()
+        image_logs = [item for item in logs if item["action"] == "image_ai_config_update"]
+        self.assertEqual(len(image_logs), 1)
+        self.assertIn("new-image-model", image_logs[0]["detail"])
+        self.assertNotIn("new-image-key", image_logs[0]["detail"])
+
+    def test_image_ai_save_restores_when_restart_fails(self):
+        self._login()
+        manager = self.app.state.image_ai_config_manager
+        form = {
+            "enabled": "1",
+            "base_url": "https://new-image.example.test/v1",
+            "api_key": "new-image-key",
+            "model": "new-image-model",
+            "size": "1024x1024",
+            "cooldown_seconds": "90",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "生图连接成功",
+                    GeneratedImage(url="https://cdn.example.test/preview.png"),
+                )
+            ),
+        ), patch.object(manager, "save", return_value=b"old"), patch.object(
+            manager, "restore"
+        ) as restore, patch.object(
+            manager, "restart_bot", return_value=(False, "Bot 重启失败")
+        ):
+            resp = self.client.post("/dashboard/image-ai/save", data=form)
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("Bot 重启失败", resp.text)
+        restore.assert_called_once_with(b"old")
+
+    def test_image_ai_save_reports_config_write_failure(self):
+        self._login()
+        manager = self.app.state.image_ai_config_manager
+        form = {
+            "enabled": "1",
+            "base_url": "https://new-image.example.test/v1",
+            "api_key": "new-image-key",
+            "model": "new-image-model",
+            "size": "1024x1024",
+            "cooldown_seconds": "90",
+        }
+
+        with patch.object(
+            manager,
+            "check",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "生图连接成功",
+                    GeneratedImage(url="https://cdn.example.test/preview.png"),
+                )
+            ),
+        ), patch.object(manager, "save", side_effect=OSError("read only")):
+            resp = self.client.post("/dashboard/image-ai/save", data=form)
 
         self.assertEqual(resp.status_code, 500)
         self.assertIn("配置保存失败", resp.text)

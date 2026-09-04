@@ -9,6 +9,7 @@ import sys
 import json
 import asyncio
 import logging
+import math
 import re
 import random
 import time as _time_mod
@@ -31,6 +32,12 @@ from adapters.qq_official import (
 )
 from adapters.koishi_bridge import adapt_koishi_payload
 from handlers.ai_chat import AIChat
+from handlers.image_gen import (
+    GeneratedImage,
+    ImageGenerator,
+    extract_image_prompt,
+    is_image_request,
+)
 from handlers import nfa, sauth, bjd, hypban, web_crawler
 from handlers import fun, bilibili, douyin, music, github
 from handlers import email_sender
@@ -56,6 +63,7 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 
 BOT_CONFIG = config.get("bot", {})
 AI_CONFIG = config.get("ai", {})
+IMAGE_AI_CONFIG = config.get("image_ai", {})
 EMAIL_CONFIG = config.get("email", {})
 BRIDGE_CONFIG = config.get("bridge", {})
 CONTROL_CONFIG = config.get("control_api", {})
@@ -77,11 +85,31 @@ def _config_value(section: dict, key: str, env_name: str | None = None, default=
     return section.get(key, default)
 
 
-def _ai_config_value(section: dict, key: str, env_name: str | None = None, default=None):
+def _ai_config_value(section, key: str, env_name: str | None = None, default=None):
+    if not isinstance(section, dict):
+        section = {}
     config_value = section.get(key)
     if config_value is not None and str(config_value).strip():
         return str(config_value).strip()
     return _config_value(section, key, env_name, default)
+
+
+def _ai_config_bool(
+    section: dict, key: str, env_name: str | None = None, default: bool = False
+) -> bool:
+    value = _ai_config_value(section, key, env_name, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _ai_config_int(
+    section: dict, key: str, env_name: str | None = None, default: int = 0
+) -> int:
+    try:
+        return int(_ai_config_value(section, key, env_name, default))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _config_bool(
@@ -139,6 +167,37 @@ AI_MODEL = str(_ai_config_value(AI_CONFIG, "model", "AI_MODEL", "deepseek-v4-fla
 AI_CONFIG["base_url"] = AI_BASE_URL
 AI_CONFIG["api_key"] = AI_API_KEY
 AI_CONFIG["model"] = AI_MODEL
+IMAGE_AI_ENABLED = _ai_config_bool(
+    IMAGE_AI_CONFIG, "enabled", "IMAGE_AI_ENABLED", False
+)
+IMAGE_AI_BASE_URL = str(
+    _ai_config_value(IMAGE_AI_CONFIG, "base_url", "IMAGE_AI_BASE_URL", "") or ""
+)
+IMAGE_AI_API_KEY = str(
+    _ai_config_value(IMAGE_AI_CONFIG, "api_key", "IMAGE_AI_API_KEY", "") or ""
+)
+IMAGE_AI_MODEL = str(
+    _ai_config_value(
+        IMAGE_AI_CONFIG,
+        "model",
+        "IMAGE_AI_MODEL",
+        "grok-imagine-1.0-fast",
+    )
+    or ""
+)
+IMAGE_AI_SIZE = str(
+    _ai_config_value(IMAGE_AI_CONFIG, "size", "IMAGE_AI_SIZE", "1024x1024")
+    or "1024x1024"
+)
+IMAGE_AI_COOLDOWN_SECONDS = max(
+    0,
+    _ai_config_int(
+        IMAGE_AI_CONFIG,
+        "cooldown_seconds",
+        "IMAGE_AI_COOLDOWN_SECONDS",
+        60,
+    ),
+)
 
 # ====== Admin/Staff/Ban 系统（openid） ======
 ADMIN_FILE = os.path.join(_BOT_DIR, "data", "admins.json")
@@ -456,6 +515,13 @@ ai_chat = AIChat(
     system_prompt=system_prompt,
     max_history=AI_CONFIG.get("max_history", 10),
 )
+image_generator = ImageGenerator(
+    base_url=IMAGE_AI_BASE_URL,
+    api_key=IMAGE_AI_API_KEY,
+    model=IMAGE_AI_MODEL,
+    size=IMAGE_AI_SIZE,
+)
+_image_cooldowns: dict[str, float] = {}
 
 # ====== 冷却/频率常量 ======
 NFA_COOLDOWN = 1800
@@ -1104,6 +1170,101 @@ async def send_c2c_msg(user_openid, content, msg_id, keyboard: dict | None = Non
         return False
 
 
+def _build_media_upload_payload(image: GeneratedImage) -> dict:
+    payload = {"file_type": 1, "srv_send_msg": False}
+    if image.url:
+        payload["url"] = image.url
+    elif image.b64_json:
+        payload["file_data"] = image.b64_json
+    else:
+        raise ValueError("image has no content")
+    return payload
+
+
+def _build_media_message_payload(file_info: str, msg_id: str, msg_seq: int) -> dict:
+    return {
+        "msg_type": 7,
+        "media": {"file_info": file_info},
+        "msg_id": msg_id,
+        "msg_seq": msg_seq,
+    }
+
+
+async def _send_image(
+    *, target_type: str, target_id: str, image: GeneratedImage, msg_id: str
+) -> bool:
+    if target_type == "group":
+        base_url = f"{API_BASE}/v2/groups/{target_id}"
+        key = f"g_{target_id}_{msg_id}"
+        log_prefix = "[AI生图] 群图片"
+    else:
+        base_url = f"{API_BASE}/v2/users/{target_id}"
+        key = f"c_{target_id}_{msg_id}"
+        log_prefix = "[AI生图] 私聊图片"
+
+    try:
+        upload_payload = _build_media_upload_payload(image)
+    except ValueError:
+        _log.warning("%s 缺少图片内容", log_prefix)
+        return False
+
+    headers = await get_auth_header()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            upload = await client.post(
+                f"{base_url}/files", headers=headers, json=upload_payload
+            )
+            if not _status_ok(upload.status_code):
+                _log.warning("%s 上传失败 HTTP %s", log_prefix, upload.status_code)
+                return False
+            try:
+                upload_result = upload.json()
+            except (TypeError, ValueError):
+                _log.warning("%s 上传响应格式无效", log_prefix)
+                return False
+            file_info = (
+                str(upload_result.get("file_info") or "").strip()
+                if isinstance(upload_result, dict)
+                else ""
+            )
+            if not file_info:
+                _log.warning("%s 上传响应缺少 file_info", log_prefix)
+                return False
+
+            response = await client.post(
+                f"{base_url}/messages",
+                headers=headers,
+                json=_build_media_message_payload(
+                    file_info, msg_id, _next_msg_seq(key)
+                ),
+            )
+            if not _status_ok(response.status_code):
+                _log.warning("%s 发送失败 HTTP %s", log_prefix, response.status_code)
+                return False
+            return True
+    except Exception as exc:
+        _log.warning("%s 异常: %s", log_prefix, type(exc).__name__)
+        return False
+
+
+async def send_group_image(group_openid, image: GeneratedImage, msg_id):
+    return await _send_image(
+        target_type="group",
+        target_id=group_openid,
+        image=image,
+        msg_id=msg_id,
+    )
+
+
+async def send_c2c_image(user_openid, image: GeneratedImage, msg_id):
+    return await _send_image(
+        target_type="c2c",
+        target_id=user_openid,
+        image=image,
+        msg_id=msg_id,
+    )
+
+
 # ====== 统一回复 ======
 async def reply(ctx, text):
     if ctx["type"] == "group":
@@ -1112,6 +1273,17 @@ async def reply(ctx, text):
     else:
         ok = await send_c2c_msg(ctx["user_openid"], text, ctx["msg_id"])
         _log_outbound_event(ctx, "c2c", ok, text)
+    return ok
+
+
+async def reply_image(ctx, image: GeneratedImage):
+    if ctx["type"] == "group":
+        ok = await send_group_image(ctx["group_openid"], image, ctx["msg_id"])
+        channel = "group"
+    else:
+        ok = await send_c2c_image(ctx["user_openid"], image, ctx["msg_id"])
+        channel = "c2c"
+    _log_outbound_event(ctx, channel, ok, "[AI 生图图片]")
     return ok
 
 
@@ -1222,6 +1394,8 @@ async def handle_command(ctx, content):
                 "/whois — 查看自己的 openid\n"
                 "━━━ AI 对话 ━━━\n"
                 "@我 + 任意内容 — AI 聊天\n"
+                "/生图 描述 — 生成一张图片\n"
+                "也可直接说：帮我画一张……\n"
                 "清除记忆 — 重置对话上下文\n"
                 "发送链接 — 自动网页分析\n"
                 "发送B站/抖音链接 — 自动解析\n"
@@ -1962,6 +2136,40 @@ async def check_weather(ctx, content):
     return False
 
 
+async def handle_image_request(ctx, content):
+    if not is_image_request(content):
+        return False
+
+    prompt = extract_image_prompt(content)
+    if not prompt:
+        await reply(ctx, "请在 /生图 后面填写图片描述\n例如：/生图 雨夜里的重庆")
+        return True
+    if not IMAGE_AI_ENABLED:
+        await reply(ctx, "AI 生图尚未启用，请联系管理员")
+        return True
+    if not image_generator.configured:
+        await reply(ctx, "AI 生图尚未配置，请联系管理员")
+        return True
+
+    user_key = str(ctx.get("limit_user_id") or ctx["user_openid"])
+    now = _time_mod.monotonic()
+    ready_at = _image_cooldowns.get(user_key, 0) + IMAGE_AI_COOLDOWN_SECONDS
+    if now < ready_at:
+        remaining = math.ceil(ready_at - now)
+        await reply(ctx, f"AI 生图冷却中，还需 {remaining} 秒")
+        return True
+
+    _image_cooldowns[user_key] = now
+    await reply(ctx, f"## AI 生图\n\n正在生成：**{prompt}**\n\n请稍候……")
+    image, error = await image_generator.generate(prompt)
+    if not image:
+        await reply(ctx, error or "图片生成失败，请稍后再试")
+        return True
+    if not await reply_image(ctx, image):
+        await reply(ctx, "图片已经生成，但发送到 QQ 失败，请稍后重试")
+    return True
+
+
 # ====== 消息入口 ======
 async def process_message(ctx, content):
     """统一消息处理入口"""
@@ -2054,7 +2262,12 @@ async def process_message(ctx, content):
     if await check_links(ctx, content):
         return
 
-    # 4. 模糊指令匹配（非已知指令才触发）
+    # 4. AI 生图
+    if await handle_image_request(ctx, content):
+        _log_command_event(ctx, content)
+        return
+
+    # 5. 模糊指令匹配（非已知指令才触发）
     if content.lower().strip() not in _KNOWN_COMMANDS:
         fuzzy = _find_fuzzy(content)
         if fuzzy:
@@ -2065,7 +2278,7 @@ async def process_message(ctx, content):
             )
             return
 
-    # 5. AI 对话
+    # 6. AI 对话
     chat_id = f"{ctx['type']}_{user_id}"
     ai_reply = await ai_chat.chat(chat_id, content)
     if len(ai_reply) > 2000:
@@ -2420,6 +2633,11 @@ async def main():
     _log.info(f"AppID: {APP_ID} | v{BOT_VERSION}")
     _log.info(
         f"环境: {'沙箱' if SANDBOX else '正式'} | AI: {AI_CONFIG.get('model', '?')}"
+    )
+    _log.info(
+        f"AI 生图: {'启用' if IMAGE_AI_ENABLED else '关闭'} | "
+        f"配置: {'完整' if image_generator.configured else '未完成'} | "
+        f"模型: {IMAGE_AI_MODEL or '未配置'}"
     )
     _log.info(f"Gateway intents: {GATEWAY_INTENTS}")
     _log.info(f"Official WS enabled: {OFFICIAL_WS_ENABLED}")
