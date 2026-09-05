@@ -134,6 +134,32 @@ class ImageRoutingTests(unittest.IsolatedAsyncioTestCase):
         image_route.assert_awaited_once_with(ctx, "帮我画一张星空")
         chat.assert_not_awaited()
 
+    async def test_pure_input_image_reaches_multimodal_chat(self):
+        ctx = {
+            "type": "c2c",
+            "user_openid": "user-a",
+            "msg_id": "msg-image",
+            "image_urls": ("https://cdn.example.test/input.jpg",),
+        }
+
+        with patch.object(bot, "_record_seen_user"), patch.object(
+            bot, "handle_command", new=AsyncMock(return_value=False)
+        ), patch.object(bot, "check_weather", new=AsyncMock(return_value=False)), patch.object(
+            bot, "check_links", new=AsyncMock(return_value=False)
+        ), patch.object(
+            bot, "handle_image_request", new=AsyncMock(return_value=False)
+        ), patch.object(
+            bot.ai_chat, "chat", new=AsyncMock(return_value="图片回复")
+        ) as chat, patch.object(bot, "reply", new=AsyncMock()) as reply:
+            await bot.process_message(ctx, "")
+
+        chat.assert_awaited_once_with(
+            "c2c_user-a",
+            "",
+            image_urls=("https://cdn.example.test/input.jpg",),
+        )
+        reply.assert_awaited_once_with(ctx, "图片回复")
+
 
 if __name__ == "__main__":
     unittest.main()

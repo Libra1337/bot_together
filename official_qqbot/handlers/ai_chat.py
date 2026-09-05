@@ -37,7 +37,12 @@ class AIChat:
             )
         return self._client
 
-    async def chat(self, chat_id: str, user_message: str) -> str:
+    async def chat(
+        self,
+        chat_id: str,
+        user_message: str,
+        image_urls: tuple[str, ...] | list[str] | None = None,
+    ) -> str:
         """发送消息并获取 AI 回复"""
         # 获取/创建对话历史
         if chat_id not in _chat_history:
@@ -45,8 +50,12 @@ class AIChat:
             while len(_chat_history) > MAX_HISTORY_CHATS:
                 _chat_history.popitem(last=False)
 
+        current_images = tuple(image_urls or ())[:4]
         history = _chat_history[chat_id]
-        history.append({"role": "user", "content": user_message})
+        history_text = user_message.strip()
+        if current_images and not history_text:
+            history_text = "[用户发送了图片]"
+        history.append({"role": "user", "content": history_text})
 
         # 截断历史
         if len(history) > self.max_history * 2:
@@ -56,6 +65,18 @@ class AIChat:
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.extend(history)
+        if current_images:
+            image_prompt = user_message.strip() or "请描述这张图片"
+            messages[-1] = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": image_prompt},
+                    *[
+                        {"type": "image_url", "image_url": {"url": url}}
+                        for url in current_images
+                    ],
+                ],
+            }
 
         try:
             client = await self._get_client()

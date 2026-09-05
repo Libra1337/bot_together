@@ -115,6 +115,34 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         process.assert_awaited_once()
 
+    async def test_c2c_image_is_forwarded_to_message_processing(self):
+        data = {
+            "id": "msg-private-image",
+            "author": {"user_openid": "user-openid"},
+            "content": "",
+            "attachments": [
+                {
+                    "content_type": "image/jpeg",
+                    "url": "https://cdn.example.test/private.jpg",
+                }
+            ],
+        }
+
+        with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
+            await bot.handle_c2c_message(data)
+
+        process.assert_awaited_once_with(
+            {
+                "type": "c2c",
+                "group_openid": "",
+                "user_openid": "user-openid",
+                "limit_user_id": "user-openid",
+                "msg_id": "msg-private-image",
+                "image_urls": ("https://cdn.example.test/private.jpg",),
+            },
+            "",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

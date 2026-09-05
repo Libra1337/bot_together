@@ -2173,7 +2173,8 @@ async def handle_image_request(ctx, content):
 # ====== 消息入口 ======
 async def process_message(ctx, content):
     """统一消息处理入口"""
-    if not content:
+    image_urls = tuple(ctx.get("image_urls") or ())
+    if not content and not image_urls:
         await reply(ctx, "喵？你叫我了吗~")
         return
 
@@ -2280,7 +2281,7 @@ async def process_message(ctx, content):
 
     # 6. AI 对话
     chat_id = f"{ctx['type']}_{user_id}"
-    ai_reply = await ai_chat.chat(chat_id, content)
+    ai_reply = await ai_chat.chat(chat_id, content, image_urls=image_urls)
     if len(ai_reply) > 2000:
         ai_reply = ai_reply[:2000] + "\n...(内容过长已截断)"
     await reply(ctx, ai_reply)
@@ -2304,7 +2305,8 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
 
     _log.info(
         f"[群消息] event={event.event_type} group={event.group_openid} "
-        f"user={event.user_openid[:8]}...: {event.content[:50]}"
+        f"user={event.user_openid[:8]}... images={len(event.image_urls)}: "
+        f"{event.content[:50]}"
     )
     await process_message(event.to_ctx(), event.content)
 
@@ -2318,7 +2320,10 @@ async def handle_c2c_message(data):
         _log.debug(f"[私聊去重] user={event.user_openid[:8]}... msg={event.msg_id}")
         return
 
-    _log.info(f"[私聊] {event.user_openid[:8]}...: {event.content[:50]}")
+    _log.info(
+        f"[私聊] {event.user_openid[:8]}... images={len(event.image_urls)}: "
+        f"{event.content[:50]}"
+    )
     await process_message(event.to_ctx(), event.content)
 
 
@@ -2343,7 +2348,8 @@ async def handle_koishi_bridge_payload(payload: dict):
         return {"ok": True, "ignored": True, "reason": "duplicate"}
     _log.info(
         f"[KoishiBridge] type={event.type} group={event.group_openid} "
-        f"user={event.user_openid[:8]}...: {event.content[:50]}"
+        f"user={event.user_openid[:8]}... images={len(event.image_urls)}: "
+        f"{event.content[:50]}"
     )
     await process_message(event.to_ctx(), event.content)
     return {"ok": True, "ignored": False}
