@@ -97,6 +97,24 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         rows = payload["keyboard"]["content"]["rows"]
         self.assertEqual([len(row["buttons"]) for row in rows], [3, 2])
 
+    async def test_resource_confirmation_keeps_markdown_without_leading_blank_line(self):
+        ctx = {"type": "group", "group_openid": "group-a", "user_openid": "user-a", "msg_id": "msg-a"}
+        with patch.object(bot, "_get_bound_email", return_value="255555@qq.com"), patch.object(
+            bot, "_send_result_email", new_callable=AsyncMock, return_value=(True, "")
+        ), patch.object(bot, "_log_email_outbound"), patch.object(bot, "_log_outbound_event"), patch.object(
+            bot.httpx, "AsyncClient", _CaptureClient
+        ):
+            ok = await bot._send_resource_result(
+                ctx, "user-a", "sauth", "4399 Sauth", "Sauth", "resource",
+                quota_text="当前获取：1/10\n限额刷新：59s",
+            )
+        self.assertTrue(ok)
+        payload = _CaptureClient.calls[0]["json"]
+        self.assertEqual(payload["msg_type"], 2)
+        self.assertIn("keyboard", payload)
+        self.assertEqual(payload["markdown"]["content"],
+            "4399 Sauth 已发送到邮箱 25\\*\\*\\*5@qq。com，请查收喵~\n当前获取：1/10\n限额刷新：59s")
+
     async def test_markdown_message_does_not_append_ads(self):
         _CaptureClient.responses = [_Response(200, "ok")]
 

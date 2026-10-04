@@ -488,7 +488,9 @@ async def _send_resource_result(
     masked_addr = _mask_email_addr(to_addr)
     _log_email_outbound(ctx, user_id, ok, subject, masked_addr)
     if ok:
-        reply_text = f"{resource_label} 已发送到邮箱 {masked_addr}，请查收喵~"
+        # The masking asterisks are literal text, not Markdown emphasis.
+        display_addr = masked_addr.replace("*", r"\*") if MARKDOWN_ENABLED else masked_addr
+        reply_text = f"{resource_label} 已发送到邮箱 {display_addr}，请查收喵~"
         if quota_text.strip():
             reply_text += f"\n{quota_text.strip()}"
         await reply(ctx, reply_text)

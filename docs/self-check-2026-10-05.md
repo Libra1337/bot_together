@@ -2,7 +2,7 @@
 
 ## Verified
 
-- Official bot: 216 offline regression tests passed, including native webhook authentication, full-group command routing, deduplication, Markdown normalization/fallback, images, resource quotas, control API, dashboard, and both compatibility bridges.
+- Official bot: 217 offline regression tests passed, including native webhook authentication, full-group command routing, deduplication, Markdown normalization/fallback, images, resource quotas, control API, dashboard, and both compatibility bridges.
 - NapCatQQ: 132 tests across five suites passed. Workspace TypeScript checks and ESLint passed after correcting 13 existing style/import-order findings.
 - All Python sources in `official_qqbot`, `qqbot`, and `only-group-bot` compiled successfully; the isolated Python environment passed `pip check`.
 - On the production host's Python 3.11 environment, a separate staging directory passed 39 routing, Markdown, webhook-authentication, and NoneBot compatibility tests. Production credentials/state were not used by these tests.
@@ -14,7 +14,7 @@ The official `GROUP_MESSAGE_CREATE` event uses the same `1 << 25` intent as grou
 
 Full-group messages now process explicit commands and active follow-ups in the same conversation. Normal chat, images, and links do not fall through to AI, and ignored events do not suppress subsequent @ deliveries. Bot-authored messages are ignored. User IDs fall back to the documented `author.id` when `member_openid` is absent.
 
-Markdown and its text fallback now remove leading empty lines, BOM, and zero-width spaces while preserving internal paragraphs and indentation. The most recent 1,000 production group/private outbound records had no leading whitespace. The reported fixed gap on every Markdown message therefore remains a QQ-client rendering question; automated payload tests do not verify the visual gap on an actual QQ client.
+Markdown and its text fallback now remove leading empty lines, BOM, and zero-width spaces while preserving internal paragraphs and indentation. Literal masking asterisks in resource-email confirmations are escaped to prevent accidental Markdown emphasis. A regression test covers the user's exact three-line “4399 Sauth 已发送到邮箱” example and verifies Markdown, keyboard, and no leading line break. Per the user's requirement, Markdown remains enabled. The most recent 1,000 production group/private outbound records had no leading whitespace. The reported fixed gap therefore still requires verification on an actual QQ client; payload tests alone do not establish that the client-rendered gap is gone.
 
 The Python webhook previously dispatched unauthenticated events. It now validates application identity and Ed25519 signatures over the original request bytes, while retaining the op-13 verification handshake. New NoneBot versions' overly strict optional fields are handled compatibly with QQ's documented payload.
 
