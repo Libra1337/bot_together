@@ -1,7 +1,7 @@
 ---
 name: miracle-console-design
 description: Presentation rules for Miracle's Chinese administration dashboard, dense data tables, and configuration forms on desktop and mobile.
-version: 2026-10-05-r2
+version: 2026-10-05-r3
 ---
 
 ## 1. Scope and Priority
@@ -12,35 +12,35 @@ version: 2026-10-05-r2
 
 ## 2. Brand and Readers
 
-- [MUST] Follow the user's modern product direction: clear hierarchy, deliberate whitespace, restrained visual detail. Avoid an overloaded collection of dashboard cards.
+- [MUST] Follow the user's supplied login and dashboard screenshots: warm light-gray canvas, white bordered cards, teal accents, icon navigation and a compact title bar. The screenshots supersede the earlier open-surface direction.
 - [SHOULD] Express precision through aligned table columns, tabular numerals, restrained borders, and explicit units.
 - [SHOULD] Use short Chinese descriptions with direct action labels. Reserve English for the brand and compact supporting labels.
 - [SHOULD] Support dense scanning on desktop and readable stacked sections on phones. Decision: observed mobile navigation previously consumed most of the first screen.
 
 ## 3. Page Structure and Composition
 
-- [SHOULD] Use a 208px quiet navigation rail and a compact expandable navigation below 900px. Limit the main content to 1240px so wide displays do not stretch small amounts of information.
+- [SHOULD] Use a 224px white navigation rail with grouped line icons, a top brand block and a bottom administrator block. Center main content at max-width 1400px, with 24–32px padding; collapse navigation below 900px.
 - [MUST] Use one page heading. Omit decorative English eyebrows, repeated breadcrumbs, taglines and repeated descriptions.
-- [SHOULD] Place a quiet utility row with snapshot time and sign-out above the heading. Use a 32px page title and one concise explanatory line.
-- [SHOULD] Compose overview pages from three unboxed numbers, one primary evidence area and one secondary activity area. Do not duplicate the navigation as a grid of shortcut cards.
+- [SHOULD] Put the single page heading and its description in a white 72px top bar; place snapshot time, settings and sign-out at the right. Do not repeat a large heading inside the content.
+- [SHOULD] Compose overview pages from a row of six compact metric cards, a primary time-series chart occupying about 60% width, and a secondary column with compact action rows above recent records. Put detailed resource evidence below.
 - [SHOULD] Use underlined page tabs to separate different tasks. Keep filters adjacent to the table and editing forms out of the default browsing flow.
-- [SHOULD] Prefer continuous white surfaces and restrained horizontal dividers over enclosing every section in a rounded card. Use one bounded table surface where it improves scanning.
+- [SHOULD] Use white cards with a one-pixel neutral border, 14px radius and a subtle shadow. Keep internal tables and forms flat. Use 20px between cards and 24px inside cards.
 - [SHOULD] Compose forms as a readable main column and a smaller supporting column; stack them on narrow screens.
 - [MUST] Keep tables horizontally scrollable inside their own region without overflowing the document.
 
 ## 4. Visual Rules
 
-- [SHOULD] Use five base colors: brand `#2563eb`, ink `#20242c`, muted `#6b7280`, canvas `#f7f8fa`, surface `#ffffff`. Derive borders and state backgrounds with opacity. Keep saturated blue for actions and selected controls.
+- [SHOULD] Use five base colors: brand `#0f807d`, ink `#25282b`, muted `#687078`, canvas `#f6f7f5`, surface `#ffffff`. Derive borders and state backgrounds with opacity. Use teal for actions, active navigation and primary chart lines; secondary series use ink/muted with distinct dash patterns.
 - [SHOULD] Use a system sans family with Chinese system fallbacks; use a system monospace family only for identifiers. Decision: no remote font dependency is needed for this existing Python HTML application.
 - [MUST] Keep body, controls, metadata, and table text at least 14px; use body line-height 1.5.
-- [SHOULD] Set page titles to 32px/1.3/600, section titles to 18px/1.4/600, numeric metrics to 36px/1.2/600. Limit heading weights so the page does not become a wall of bold text.
+- [SHOULD] Set page titles to 18px/1.3/600, section titles to 17px/1.4/600, numeric metrics to 26px/1.2/600. Limit heading weights so the page does not become a wall of bold text.
 - [MUST] Render counts with tabular numerals and align numeric column headers and cells to the right.
 - [SHOULD] Use 8/12/16/24/32/40px spacing, 10px surface radii and 7px control radii. Use 32–40px between sections and 12–16px within related controls; avoid equal spacing between everything.
 - [SHOULD] Keep static panels still on hover. Reserve state transitions for controls and navigable rows.
 - [MUST] Show keyboard focus with a visible 2px brand outline and 3px offset.
 - [MUST] Keep touch controls at least 40px high and give each an accessible name.
-- [SHOULD] Use solid colors, no gradients, no decorative images or icon tiles. Decision: data is the primary visual material.
-- [SHOULD] Use native progress meters only for ratios with matching numerator and denominator. Prefer numbers for short resource lists. Never encode nested time windows as parts of one pie.
+- [SHOULD] Use solid colors and restrained line icons. A small teal tinted brand emblem is permitted to match the reference. No ornamental illustration or invented status badges.
+- [SHOULD] Use native progress meters only for ratios with matching numerator and denominator. Use chronological buckets for trends, with actual timestamps, counts and an accessible numeric alternative. Never encode nested time windows as parts of one pie.
 - [MUST] Pair status colors with words; never communicate a status using color alone.
 - [MUST] Provide visible empty, error, disabled, and loading states where applicable.
 - [MUST] Disable nonessential transitions under `prefers-reduced-motion`.
@@ -62,6 +62,8 @@ version: 2026-10-05-r2
 | Dialog | `.confirm-dialog` | `dashboard.css` | Destructive action confirmation | Implemented |
 | Page tabs | `.mc-tabs`, `.is-active` | `dashboard.css` | Linked task views | Implemented |
 | Resource rows | `.mc-resource-list`, `.mc-resource-row` | `dashboard.css` | Resource identity, totals and a contextual action | Implemented |
+| Trend | `.mc-trend-chart`, `.mc-chart-controls`, `.mc-chart-legend` | `dashboard.css`, `dashboard_trend.py` | Time series with accessible details | Implemented |
+| Overview | `.mc-stat-grid`, `.mc-home-grid`, `.mc-home-side`, `.mc-action-list` | `dashboard.css` | Reference composition | Implemented |
 | Disclosure | `.mc-disclosure`, `.mc-rule` | `dashboard.css` | Secondary details and inline rule editing | Implemented |
 
 - [SHOULD] Extend page-specific compositions with `.mc-*` names. Decision: preserve existing shared selectors without adding a second theme.
@@ -80,11 +82,13 @@ version: 2026-10-05-r2
 
 - [SHOULD] Avoid centered hero sections in administration views.
 - [SHOULD] Avoid cards inside cards and excessive empty columns.
-- [SHOULD] Avoid decorative icon tiles and colored icon backgrounds.
+- [SHOULD] Keep navigation icons unboxed. Reserve a tinted icon surface for the small brand emblem.
 - [SHOULD] Avoid colors and typography outside the shared primitives.
 - [MUST] Avoid small low-contrast primary information.
 - [SHOULD] Avoid pill labels for ordinary metadata.
 - [MUST] Do not imply a trend from a set of nested duration totals.
+
+- [SHOULD] Center the sign-in card within the viewport on the warm gray canvas. Use a 400px card, brand emblem/name inside, a labeled token field, full-width teal button and a separated security note.
 
 ## 8. Implementation and Integration
 

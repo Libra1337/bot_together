@@ -418,6 +418,19 @@ class DashboardAppTests(unittest.TestCase):
         self.assertIn(':focus-visible', text)
         self.assertEqual(text.count('<h1'), 1)
 
+    def test_overview_trend_uses_selected_interval_and_escapes_recent_users(self):
+        self._login()
+        self.app.state.control_service.record_resource_usage('163', '<script>danger</script>')
+        response = self.client.get('/dashboard?interval=day')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('最近 7 个自然日', response.text)
+        self.assertIn('data-trend-readings=', response.text)
+        self.assertIn('查看分时数据', response.text)
+        self.assertIn('&lt;script&gt;danger&lt;/script&gt;', response.text)
+        self.assertNotIn('<script>danger</script>', response.text)
+        response = self.client.get('/dashboard?interval=not-valid')
+        self.assertIn('最近 24 个小时', response.text)
+
     def test_limits_dashboard_shows_totals_and_personal_quotas_separately(self):
         self._login()
         service = self.app.state.control_service

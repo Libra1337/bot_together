@@ -15,7 +15,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .ai_config import AIConfigManager, AISettings
 from .auth import require_admin_token, require_bot_token
 from .db import create_app_engine, init_db
-from .dashboard_ui import render_layout, render_login
+from .dashboard_ui import icon, render_layout, render_login
+from .dashboard_trend import render_trend
 from . import dashboard_usage as usage_ui
 from .image_ai_config import IMAGE_SIZES, ImageAIConfigManager, ImageAISettings
 from .schemas import (
@@ -260,7 +261,7 @@ def create_app(
         auth = _dashboard_auth_redirect(request, dashboard_secret)
         if auth:
             return auth
-        return HTMLResponse(_overview_page(service))
+        return HTMLResponse(_overview_page(service, request.query_params))
 
     @app.get("/dashboard/ads", response_class=HTMLResponse)
     def dashboard_ads(request: Request):
@@ -893,29 +894,40 @@ def _login_html(error: str = "") -> str:
     return render_login(error)
 
 
-def _overview_page(service: ControlService) -> str:
+def _overview_page(service: ControlService, params=None) -> str:
     users = _list_all_users(service)
     roles = service.list_roles()
     counts = _counts(users, roles)
-    stats = service.list_resource_usage_stats()
-    total = sum(item["counts"]["day"] for item in stats)
-    recent = service.list_command_logs(limit=6)
-    recent_html = "".join(
-        f'<div class="mc-activity-item"><div><strong>{html.escape(item.get("command", ""))}</strong><time>{html.escape(usage_ui.short_time(item.get("created_at", "")))}</time></div><code>{html.escape(item.get("user_key", ""))}</code></div>'
-        for item in recent
-    ) or '<div class="empty">还没有新活动<span class="cell-note">机器人收到指令后，记录将显示在这里。</span></div>'
-    body = f"""
-    <section class="mc-overview-stats" aria-label="使用概况">
-      {_metric("近 24 小时获取", total, "全部资源 · 次")}
-      {_metric("用户总数", counts["users"], f"已记录 {counts['users']} 个 OpenID")}
-      {_metric("管理成员", counts["admins"] + counts["staff"], f"管理员 {counts['admins']} · Staff {counts['staff']}")}
-    </section>
-    <section class="mc-overview-grid">
-      <div class="panel"><div class="panel-head"><h2>资源使用</h2><a href="/dashboard/limits?view=rules">管理限制</a></div>{usage_ui.resource_list(stats)}</div>
-      <div class="panel mc-activity"><div class="panel-head"><h2>最近活动</h2><a href="/dashboard/logs">查看全部</a></div>{recent_html}</div>
-    </section>
-    """
-    return _layout("控制台", "overview", body)
+    now = datetime.now(timezone.utc)
+    stats = service.list_resource_usage_stats(now=now)
+    limits = service.list_resource_limits()
+    trend = service.resource_usage_trend((params or {}).get("interval", "hour"), now=now)
+    metrics = [
+        ("用户总数", counts["users"], f"已记录 {counts['users']} 个 OpenID", "users"),
+        ("近 24 小时获取", sum(item['counts']['day'] for item in stats), "全部资源成功获取", "activity"),
+        ("近 1 小时获取", sum(item['counts']['hour'] for item in stats), "全部用户 · 次", "calendar"),
+        ("限制规则", len(limits), "按资源独立设置", "limits"),
+        ("管理成员", counts['admins'] + counts['staff'], "管理员与 Staff", "permissions"),
+        ("已封禁用户", counts['banned'], "当前受限账户", "bans"),
+    ]
+    cards = ''.join(f'<div class="mc-stat-card"><div class="mc-stat-label"><span>{label}</span>{icon(symbol)}</div><strong>{value:,}</strong><small>{html.escape(note)}</small></div>' for label, value, note, symbol in metrics)
+    actions = ''.join(f'<a href="{url}">{icon(symbol)}<span><strong>{title}</strong><small>{note}</small></span>{icon("arrow")}</a>' for url, title, note, symbol in [
+        ("/dashboard/limits?view=rules", "调整获取限制", "设置各资源的个人额度", "limits"),
+        ("/dashboard/logs", "查看运行记录", "命令、发送与管理操作", "logs"),
+        ("/dashboard/ai", "配置 AI 服务", "管理模型与连接设置", "ai"),
+    ])
+    recent_rows = ''.join(f'<tr><td>{html.escape(item["resource"].upper())}</td><td><code title="{html.escape(item["user_key"], quote=True)}">{html.escape(item["user_key"])}</code></td><td class="numeric">{html.escape(usage_ui.short_time(item["used_at"]))}</td></tr>' for item in service.recent_resource_usage())
+    recent = '<div class="table-wrap"><table class="mc-recent-table"><thead><tr><th scope="col">资源</th><th scope="col">用户</th><th scope="col" class="numeric">时间</th></tr></thead><tbody>' + (recent_rows or '<tr><td colspan="3" class="empty">暂无获取记录</td></tr>') + '</tbody></table></div>'
+    body = f'''<section class="mc-stat-grid" aria-label="使用概况">{cards}</section>
+      <section class="mc-home-grid">
+        <div class="panel mc-trend-panel">{render_trend(trend)}</div>
+        <div class="mc-home-side">
+          <section class="panel"><div class="panel-head"><h2>快捷操作</h2></div><div class="mc-action-list">{actions}</div></section>
+          <section class="panel"><div class="panel-head"><h2>最近获取</h2><a href="/dashboard/limits">查看用量</a></div>{recent}</section>
+        </div>
+      </section>
+      <section class="panel"><div class="panel-head"><div><h2>资源用量</h2><p>全体用户获取次数 · 滚动窗口统计</p></div><a href="/dashboard/limits">用户明细</a></div>{usage_ui.usage_summary(stats)}<p class="field-note">时间窗口互有重叠，不能相加。个人限额按每位用户独立计算。</p></section>'''
+    return _layout("仪表盘", "overview", body)
 
 
 def _ads_page(service: ControlService) -> str:
@@ -1086,10 +1098,6 @@ def _counts(users: list[dict], roles: list[dict]) -> dict:
 
 def _list_all_users(service: ControlService) -> list[dict]:
     return service.list_users(limit=None)
-
-
-def _metric(label: str, value: int, note: str = "") -> str:
-    return f"<div class='metric'><span>{html.escape(label)}</span><strong>{value:,}</strong><small>{html.escape(note)}</small></div>"
 
 
 def _users_table(users: list[dict]) -> str:

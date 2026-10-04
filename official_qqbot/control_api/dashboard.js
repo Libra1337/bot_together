@@ -1,6 +1,22 @@
 (() => {
   'use strict';
 
+  document.querySelectorAll('[data-trend-readings]').forEach((chart) => {
+    const readings = JSON.parse(chart.dataset.trendReadings);
+    const slider = chart.querySelector('input[type="range"]');
+    const output = chart.querySelector('output');
+    const show = (index) => {
+      output.textContent = readings[index];
+      slider.value = String(index);
+      slider.setAttribute('aria-valuetext', readings[index]);
+    };
+    slider.addEventListener('input', () => show(Number(slider.value)));
+    chart.querySelectorAll('[data-trend-index]').forEach((point) => {
+      point.addEventListener('pointerenter', () => show(Number(point.dataset.trendIndex)));
+    });
+    show(Number(slider.value));
+  });
+
   // Legacy forms use sibling labels. Associate only an unambiguous next control.
   let fieldSequence = 0;
   document.querySelectorAll('label:not([for])').forEach((label) => {

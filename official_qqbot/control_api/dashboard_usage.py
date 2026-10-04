@@ -9,19 +9,6 @@ UNITS = {"min": "分钟", "hour": "小时", "day": "天", "month": "30 天", "qu
 NAMES = {"163": "163 小号", "4399": "4399 账号", "nfa": "NFA Token"}
 
 
-def resource_list(stats):
-    rows = []
-    for item in stats:
-        resource = item['resource']
-        rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], "")}' if item['limit_count'] else '未设置限额'
-        rows.append(f'''<div class="mc-resource-row">
-          <div class="mc-resource-title"><h3>{esc(NAMES[resource])}</h3><p>个人限额 · {esc(rule)}</p></div>
-          <div class="mc-resource-count"><strong>{item['counts']['day']:,}</strong><small>近 24 小时获取</small></div>
-          <a class="button ghost" href="/dashboard/limits?resource={resource}">查看用量<span class="sr-only"> · {esc(NAMES[resource])}</span></a>
-        </div>''')
-    return '<div class="mc-resource-list">' + ''.join(rows) + '</div>'
-
-
 def rule_list(stats, form=None):
     form = form or {}
     rows = []

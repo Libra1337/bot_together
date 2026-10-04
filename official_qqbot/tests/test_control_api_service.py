@@ -7,6 +7,37 @@ from control_api.service import ControlService
 
 
 class ControlApiServiceTests(unittest.TestCase):
+    def test_usage_trend_has_disjoint_buckets_and_excludes_future_records(self):
+        now = datetime(2026, 10, 4, 17, 30, tzinfo=timezone.utc)
+        for resource, stamp in [
+            ("163", now.replace(minute=0)),
+            ("163", now.replace(minute=0) - timedelta(microseconds=1)),
+            ("4399", now),
+            ("nfa", now + timedelta(seconds=1)),
+            ("nfa", now - timedelta(days=2)),
+        ]:
+            self.service.record_resource_usage(resource, "trend-user", used_at=stamp)
+        trend = self.service.resource_usage_trend("hour", now=now)
+        self.assertEqual(len(trend['labels']), 24)
+        self.assertEqual(trend['labels'][-1], '10-05 01:00')
+        self.assertEqual(trend['series']['163'][-2:], [1, 1])
+        self.assertEqual(trend['series']['4399'][-1], 1)
+        self.assertEqual(sum(trend['series']['nfa']), 0)
+        self.assertEqual(trend['total'], 3)
+        self.assertEqual(self.service.resource_usage_trend('invalid', now=now)['interval'], 'hour')
+
+    def test_daily_usage_trend_uses_beijing_midnight_and_zero_fills(self):
+        now = datetime(2026, 10, 4, 17, 30, tzinfo=timezone.utc)
+        midnight = datetime(2026, 10, 4, 16, tzinfo=timezone.utc)
+        self.service.record_resource_usage('163', 'before', used_at=midnight-timedelta(seconds=1))
+        self.service.record_resource_usage('163', 'after', used_at=midnight)
+        trend = self.service.resource_usage_trend('day', now=now)
+        self.assertEqual(trend['labels'][-1], '10-05 00:00')
+        self.assertEqual(trend['series']['163'], [0, 0, 0, 0, 0, 1, 1])
+        minute = self.service.resource_usage_trend('minute', now=now)
+        self.assertEqual(len(minute['labels']), 60)
+        self.assertEqual(minute['total'], 0)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.engine = create_app_engine(f"sqlite:///{self.tmp.name}/control.db")
