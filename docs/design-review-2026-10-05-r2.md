@@ -48,3 +48,9 @@ Limits: production deployment and external AI calls are outside this revision's 
 First and final screenshot evidence is preserved under ignored `.venv/dashboard-review-r2/`: `overview-first.jpg`, `overview-desktop.jpg`, `overview-mobile.jpg`, `usage-desktop.jpg`, `rules-mobile.jpg`.
 
 The local preview runs at `http://127.0.0.1:9088/dashboard`. Its data remains explicitly labeled as a preview. No production deployment was attempted. Performance at production scale and other browser engines were not measured. The user's aesthetic acceptance remains an open question; rendered checks do not establish it.
+
+## Restoration and local adjustments
+
+The user subsequently rejected the teal revision and explicitly selected restoration of the previous white, simple layout with local adjustments. The teal revision was reverted. Roles, bans and advertisements now use a full-width list with a native collapsed creation form above it; duplicate headings were replaced with record counts. Existing forms, authentication and database operations remain in place.
+
+The restored permissions page was checked at 1440 x 900 and 390 x 844, including its expanded form: one h1, no document overflow, readable controls. Current screenshot: `.venv/dashboard-review-r2/permissions-restored.jpg` (ignored local evidence). The existing 223-test suite passed again after these adjustments, and JavaScript syntax and whitespace checks passed. This is a small repair in the existing generation context, not a new design direction. Deployment is authorized and tracked separately from this visual review.

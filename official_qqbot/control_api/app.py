@@ -921,12 +921,8 @@ def _overview_page(service: ControlService) -> str:
 def _ads_page(service: ControlService) -> str:
     ads = _read_ads()
     body = f"""
-    <section class="mc-manage-grid">
-      <div class="panel wide">
-        <div class="panel-head"><h2>广告列表</h2><span>管理展示内容与有效期</span></div>
-        {_ads_table(ads)}
-      </div>
-      <details class="panel mc-editor" open><summary>新增广告</summary>
+    <section class="panel">
+      <details class="mc-add-record"><summary>新增广告</summary>
 
         <form class="stack-form" method="post" action="/dashboard/ads">
           <label>广告内容</label>
@@ -937,6 +933,8 @@ def _ads_page(service: ControlService) -> str:
           <button type="submit" class="primary wide-btn">保存广告</button>
         </form>
       </details>
+      <p class="field-note">共 {len(ads):,} 条广告</p>
+      {_ads_table(ads)}
     </section>
     """
     return _layout("广告管理", "ads", body)
@@ -947,7 +945,7 @@ def _users_page(service: ControlService) -> str:
     enriched = [service.get_user_state(item["user_key"]) | item for item in users]
     body = f"""
     <section class="panel">
-      <div class="panel-head"><h2>用户列表</h2><span>OpenID / 绑定邮箱 / 状态</span></div>
+      <p class="mc-list-caption">共 {len(enriched):,} 位用户 · 绑定邮箱与当前状态</p>
       {_users_table(enriched)}
     </section>
     """
@@ -957,15 +955,10 @@ def _users_page(service: ControlService) -> str:
 def _permissions_page(service: ControlService) -> str:
     roles = service.list_roles()
     body = f"""
-    <section class="mc-manage-grid">
-      <div class="panel">
-        <div class="panel-head"><h2>权限管理</h2><span>管理员 / Staff</span></div>
-        {_roles_table(roles)}
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h2>授予权限</h2><span>管理员 / Staff</span></div>
-        {_role_form()}
-      </div>
+    <section class="panel">
+      <details class="mc-add-record"><summary>授予权限</summary>{_role_form()}</details>
+      <p class="mc-list-caption">共 {len(roles):,} 条授权 · 管理员 / Staff</p>
+      {_roles_table(roles)}
     </section>
     """
     return _layout("权限管理", "permissions", body)
@@ -975,15 +968,10 @@ def _bans_page(service: ControlService) -> str:
     users = _list_all_users(service)
     banned = [item for item in users if item["is_banned"]]
     body = f"""
-    <section class="mc-manage-grid">
-      <div class="panel">
-        <div class="panel-head"><h2>封禁名单</h2><span>已封禁 OpenID</span></div>
-        {_bans_table(banned)}
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h2>封禁 OpenID</h2><span>立即生效</span></div>
-        {_ban_form()}
-      </div>
+    <section class="panel">
+      <details class="mc-add-record"><summary>封禁用户</summary>{_ban_form()}</details>
+      <p class="mc-list-caption">共 {len(banned):,} 位受限用户</p>
+      {_bans_table(banned)}
     </section>
     """
     return _layout("封禁名单", "bans", body)

@@ -63,6 +63,7 @@ version: 2026-10-05-r2
 | Page tabs | `.mc-tabs`, `.is-active` | `dashboard.css` | Linked task views | Implemented |
 | Resource rows | `.mc-resource-list`, `.mc-resource-row` | `dashboard.css` | Resource identity, totals and a contextual action | Implemented |
 | Disclosure | `.mc-disclosure`, `.mc-rule` | `dashboard.css` | Secondary details and inline rule editing | Implemented |
+| Record creation | `.mc-add-record`, `.mc-list-caption` | `dashboard.css` | Collapsed creation form above a full-width list and a quiet count caption | Implemented |
 
 - [SHOULD] Extend page-specific compositions with `.mc-*` names. Decision: preserve existing shared selectors without adding a second theme.
 - [MUST] Do not silently alter shared primitives from page-specific selectors.
