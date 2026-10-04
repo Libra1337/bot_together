@@ -302,7 +302,7 @@ def create_app(
         auth = _dashboard_auth_redirect(request, dashboard_secret)
         if auth:
             return auth
-        return HTMLResponse(_logs_page(service))
+        return HTMLResponse(_logs_page(service, request.query_params))
 
     @app.get("/dashboard/settings", response_class=HTMLResponse)
     def dashboard_settings(request: Request):
@@ -631,8 +631,8 @@ def create_app(
                 updated_by="dashboard",
             )
         except (ValueError, TypeError):
-            return HTMLResponse(_limits_page(service, error="请输入 1–1,000,000 之间的次数，并选择有效的资源和周期。"), status_code=400)
-        return RedirectResponse("/dashboard/limits?saved=1", status_code=303)
+            return HTMLResponse(_limits_page(service, {"view": "rules"}, error="请输入 1–1,000,000 之间的次数，并选择有效的资源和周期。", form=form), status_code=400)
+        return RedirectResponse("/dashboard/limits?view=rules&saved=1", status_code=303)
 
     @app.post("/dashboard/resource-limits/reset-usage")
     def dashboard_reset_resource_usage(request: Request):
@@ -783,7 +783,7 @@ def _ai_page(
         <div class="panel-head"><h2>生效规则</h2><span>变更可追溯</span></div>
         <div class="settings-list">
           <div><span>检测连接</span><strong>只检测，不修改当前配置</strong></div>
-          <div><span>保存并重启</span><strong>检测通过后更新配置并重启 official-qqbot</strong></div>
+          <div><span>保存并重启</span><strong>检测通过后更新配置并重启机器人</strong></div>
           <div><span>重启失败</span><strong>自动恢复旧配置，不重启控制台</strong></div>
         </div>
       </div>
@@ -896,33 +896,23 @@ def _login_html(error: str = "") -> str:
 def _overview_page(service: ControlService) -> str:
     users = _list_all_users(service)
     roles = service.list_roles()
-    limits = service.list_resource_limits()
-    ads = _read_ads()
     counts = _counts(users, roles)
     stats = service.list_resource_usage_stats()
     total = sum(item["counts"]["day"] for item in stats)
-    recent = service.list_command_logs(limit=5)
+    recent = service.list_command_logs(limit=6)
     recent_html = "".join(
-        f'<div><strong>{html.escape(item.get("command", ""))}</strong><span>{html.escape(item.get("created_at", ""))}</span></div>'
+        f'<div class="mc-activity-item"><div><strong>{html.escape(item.get("command", ""))}</strong><time>{html.escape(usage_ui.short_time(item.get("created_at", "")))}</time></div><code>{html.escape(item.get("user_key", ""))}</code></div>'
         for item in recent
-    ) or '<div class="empty">暂无命令记录<span class="cell-note">用户调用机器人后，最近活动会显示在这里。</span></div>'
+    ) or '<div class="empty">还没有新活动<span class="cell-note">机器人收到指令后，记录将显示在这里。</span></div>'
     body = f"""
-    <section class="metrics">
-      {_metric("已记录用户", counts["users"], "跨群与私聊")}
+    <section class="mc-overview-stats" aria-label="使用概况">
       {_metric("近 24 小时获取", total, "全部资源 · 次")}
+      {_metric("用户总数", counts["users"], f"已记录 {counts['users']} 个 OpenID")}
       {_metric("管理成员", counts["admins"] + counts["staff"], f"管理员 {counts['admins']} · Staff {counts['staff']}")}
-      {_metric("已封禁用户", counts["banned"], "当前限制状态")}
     </section>
-    <section class="mc-limit-grid">
-      <div class="panel"><div class="panel-head"><div><h2>资源获取概况</h2><p class="cell-note">近 24 小时 · 全部用户成功获取次数</p></div><a href="/dashboard/limits">查看用量明细 →</a></div>{usage_ui.comparison_bars(stats)}</div>
-      <div class="panel"><div class="panel-head"><h2>最近命令</h2><a href="/dashboard/logs">全部日志 →</a></div><div class="mc-recent-list">{recent_html}</div></div>
-    </section>
-    <div class="mc-section-head"><h2>管理工作区</h2><span>常用配置与操作</span></div>
-    <section class="grid">
-      {_quick_card("广告管理", f"共 {len(ads)} 条，启用 {len([a for a in ads if a.get('enabled')])} 条", "/dashboard/ads")}
-      {_quick_card("用户列表", f"已记录 {counts['users']} 个 OpenID", "/dashboard/users")}
-      {_quick_card("获取限制", f"当前 {len(limits)} 条限制规则", "/dashboard/limits")}
-      {_quick_card("日志审计", "查看命令、发送、权限变更记录", "/dashboard/logs")}
+    <section class="mc-overview-grid">
+      <div class="panel"><div class="panel-head"><h2>资源使用</h2><a href="/dashboard/limits?view=rules">管理限制</a></div>{usage_ui.resource_list(stats)}</div>
+      <div class="panel mc-activity"><div class="panel-head"><h2>最近活动</h2><a href="/dashboard/logs">查看全部</a></div>{recent_html}</div>
     </section>
     """
     return _layout("控制台", "overview", body)
@@ -931,9 +921,13 @@ def _overview_page(service: ControlService) -> str:
 def _ads_page(service: ControlService) -> str:
     ads = _read_ads()
     body = f"""
-    <section class="split">
-      <div class="panel">
-        <div class="panel-head"><h2>新增广告</h2><span>对应 Bot 的 /ad+ /ads+</span></div>
+    <section class="mc-manage-grid">
+      <div class="panel wide">
+        <div class="panel-head"><h2>广告列表</h2><span>管理展示内容与有效期</span></div>
+        {_ads_table(ads)}
+      </div>
+      <details class="panel mc-editor" open><summary>新增广告</summary>
+
         <form class="stack-form" method="post" action="/dashboard/ads">
           <label>广告内容</label>
           <textarea name="content" placeholder="输入要追加到机器人回复底部的广告内容"></textarea>
@@ -942,11 +936,7 @@ def _ads_page(service: ControlService) -> str:
           <label class="check"><input type="checkbox" name="enabled" value="1"> 新增后立即展示</label>
           <button type="submit" class="primary wide-btn">保存广告</button>
         </form>
-      </div>
-      <div class="panel wide">
-        <div class="panel-head"><h2>广告列表</h2><span>读取 data/ads.json</span></div>
-        {_ads_table(ads)}
-      </div>
+      </details>
     </section>
     """
     return _layout("广告管理", "ads", body)
@@ -967,13 +957,13 @@ def _users_page(service: ControlService) -> str:
 def _permissions_page(service: ControlService) -> str:
     roles = service.list_roles()
     body = f"""
-    <section class="grid">
+    <section class="mc-manage-grid">
       <div class="panel">
         <div class="panel-head"><h2>权限管理</h2><span>管理员 / Staff</span></div>
         {_roles_table(roles)}
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>授予权限</h2><span>写入云端数据库</span></div>
+        <div class="panel-head"><h2>授予权限</h2><span>管理员 / Staff</span></div>
         {_role_form()}
       </div>
     </section>
@@ -985,7 +975,7 @@ def _bans_page(service: ControlService) -> str:
     users = _list_all_users(service)
     banned = [item for item in users if item["is_banned"]]
     body = f"""
-    <section class="grid">
+    <section class="mc-manage-grid">
       <div class="panel">
         <div class="panel-head"><h2>封禁名单</h2><span>已封禁 OpenID</span></div>
         {_bans_table(banned)}
@@ -999,7 +989,7 @@ def _bans_page(service: ControlService) -> str:
     return _layout("封禁名单", "bans", body)
 
 
-def _limits_page(service: ControlService, params=None, error: str = "") -> str:
+def _limits_page(service: ControlService, params=None, error: str = "", form=None) -> str:
     params = params or {}
     resource = str(params.get("resource", ""))
     if resource not in {"163", "4399", "nfa"}:
@@ -1009,67 +999,58 @@ def _limits_page(service: ControlService, params=None, error: str = "") -> str:
         page = max(1, int(params.get("page", 1)))
     except (ValueError, TypeError):
         page = 1
+    rules_view = params.get("view") == "rules"
     now = datetime.now(timezone.utc)
-    limits = service.list_resource_limits()
     stats = service.list_resource_usage_stats(now=now)
-    users = service.list_resource_user_usage(resource=resource, query=query, page=page, now=now)
     notices = f'<div class="notice error" role="alert">{html.escape(error)}</div>' if error else ""
     if params.get("saved") == "1":
         notices += '<div class="notice success" role="status">限制规则已保存，对所有群和私聊生效。</div>'
-    total_day = sum(item["counts"]["day"] for item in stats)
-    total_hour = sum(item["counts"]["hour"] for item in stats)
-    body = f"""
-    {notices}
-    <div class="mc-page-actions"><a class="button ghost" href="/dashboard/limits?{html.escape(urlencode({'resource': resource, 'q': query, 'page': page}))}">刷新数据</a><a class="button" href="#rule-editor">调整限制</a></div>
-    <section class="metrics" aria-label="用量摘要">
-      {_metric("近 24 小时获取", total_day, "全部用户 · 次")}
-      {_metric("近 1 小时获取", total_hour, "全部用户 · 次")}
-      {_metric("已配置规则", len(limits), "按用户独立计数")}
-      {_metric("当前筛选用户用量", users['total'], "用户与资源组合 · 条")}
-    </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>资源用量总览</h2><p class="cell-note">各时间窗口内的成功获取次数，覆盖全部用户。</p></div><span>滚动窗口统计</span></div>
-      {usage_ui.usage_summary(stats)}
-      <p class="mc-section-note">时间窗口互有重叠，不能相加。全体获取次数不代表单个用户已使用的额度。</p>
-    </section>
-    <section class="panel" id="user-usage">
-      <div class="panel-head"><div><h2>用户用量明细</h2><p class="cell-note">按每位用户的限额周期计算；跨群、私聊共用额度。</p></div><span>当前有效记录</span></div>
-      {usage_ui.filters(resource, query)}
-      {usage_ui.user_usage_table(users)}
-      {usage_ui.pagination(users, resource, query)}
-    </section>
-    <section class="mc-limit-grid">
-      <div class="panel"><div class="panel-head"><div><h2>限制规则</h2><p class="cell-note">数量为每位用户在滚动周期内可获取的次数。</p></div></div>
-        {_limits_table(limits)}
-        <div class="mc-section-head"><h2>近 24 小时资源对比</h2><span>全部用户 · 次</span></div>
-        {usage_ui.comparison_bars(stats)}
-      </div>
-      <div class="panel" id="rule-editor"><div class="panel-head"><h2>调整限制</h2></div>{_limit_form()}</div>
-    </section>
-    """
-    return _layout("获取限制", "limits", body)
+    tabs = '<nav class="mc-tabs" aria-label="获取限制视图">' + ''.join(
+        f'<a href="{url}" class="{ "is-active" if active else ""}"' + (' aria-current="page"' if active else '') + f'>{label}</a>'
+        for url, label, active in [("/dashboard/limits", "用户用量", not rules_view), ("/dashboard/limits?view=rules", "限制规则", rules_view)]
+    ) + '</nav>'
+    if rules_view:
+        content = f'''<section class="panel">
+          <div class="panel-head"><div><h2>限制规则</h2><p>选择资源以修改个人额度。已有获取记录会继续计入。</p></div></div>
+          {usage_ui.rule_list(stats, form)}
+          <p class="field-note">限额在群聊与私聊间共用，按滚动周期释放。</p>
+          <details class="mc-reset"><summary>重置获取记录</summary>
+            <p>将清空所有资源的用量历史，所有用户重新获得额度。此操作不可撤销。</p>
+            <form method="post" action="/dashboard/resource-limits/reset-usage" data-confirm="确定清空全部资源的获取记录？所有用户额度会重置，此操作不可撤销。"><button class="danger">重置全部记录</button></form>
+          </details>
+        </section>'''
+    else:
+        users = service.list_resource_user_usage(resource=resource, query=query, page=page, now=now)
+        refresh = html.escape(urlencode({"resource": resource, "q": query, "page": page}))
+        content = f'''<section class="panel" id="user-usage">
+          <div class="mc-toolbar-title"><div><h2>用户用量明细</h2><span>{users['total']:,} 条有效用量</span></div><a class="button ghost" href="/dashboard/limits?{refresh}">刷新数据</a></div>
+          {usage_ui.filters(resource, query)}
+          {usage_ui.user_usage_table(users)}
+          {usage_ui.pagination(users, resource, query)}
+          <p class="field-note">按个人滚动周期统计，群聊与私聊共用额度。下次释放是最早一条记录释放的时间，并非全部额度重置。</p>
+        </section>
+        <details class="mc-disclosure"><summary>资源用量总览<span>查看各时间窗口的全体获取次数</span></summary>
+          {usage_ui.usage_summary(stats)}
+          <p class="field-note">滚动窗口互有重叠，不能相加；全体次数不代表个人已用额度。</p>
+        </details>'''
+    return _layout("获取限制", "limits", notices + tabs + content)
 
 
-def _logs_page(service: ControlService) -> str:
-    command_logs = service.list_command_logs(limit=50)
-    audit_logs = service.list_audit_logs(limit=50)
-    outbound_logs = service.list_outbound_logs(limit=50)
-    body = f"""
-    <section class="grid">
-      <div class="panel">
-        <div class="panel-head"><h2>命令日志</h2><span>最近 50 条</span></div>
-        {_logs_table(command_logs, ["created_at", "user_key", "command", "content"])}
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h2>审计日志</h2><span>权限 / 封禁 / 广告</span></div>
-        {_logs_table(audit_logs, ["created_at", "actor_user_key", "action", "target_user_key", "detail"])}
-      </div>
-      <div class="panel span-2">
-        <div class="panel-head"><h2>发送日志</h2><span>邮件 / 消息</span></div>
-        {_logs_table(outbound_logs, ["created_at", "user_key", "channel", "status", "content"])}
-      </div>
-    </section>
-    """
+def _logs_page(service: ControlService, params=None) -> str:
+    selected = (params or {}).get("view", "commands")
+    views = {
+        "commands": ("命令记录", service.list_command_logs, ["created_at", "user_key", "command", "content"]),
+        "outbound": ("发送记录", service.list_outbound_logs, ["created_at", "user_key", "channel", "status", "content"]),
+        "audit": ("管理操作", service.list_audit_logs, ["created_at", "actor_user_key", "action", "target_user_key", "detail"]),
+    }
+    if selected not in views:
+        selected = "commands"
+    tabs = '<nav class="mc-tabs" aria-label="日志类型">' + ''.join(
+        f'<a href="/dashboard/logs?view={key}" class="{ "is-active" if key == selected else ""}"' + (' aria-current="page"' if key == selected else '') + f'>{value[0]}</a>'
+        for key, value in views.items()
+    ) + '</nav>'
+    label, load, columns = views[selected]
+    body = tabs + f'<section class="panel"><div class="panel-head"><h2>{label}</h2><span>最近 50 条</span></div>{_logs_table(load(limit=50), columns)}</section>'
     return _layout("日志审计", "logs", body)
 
 
@@ -1109,16 +1090,6 @@ def _list_all_users(service: ControlService) -> list[dict]:
 
 def _metric(label: str, value: int, note: str = "") -> str:
     return f"<div class='metric'><span>{html.escape(label)}</span><strong>{value:,}</strong><small>{html.escape(note)}</small></div>"
-
-
-def _quick_card(title: str, subtitle: str, href: str) -> str:
-    return (
-        "<a class='quick-card' href='"
-        + html.escape(href)
-        + "'>"
-        + f"<h2>{html.escape(title)}</h2><p>{html.escape(subtitle)}</p>"
-        + "</a>"
-    )
 
 
 def _users_table(users: list[dict]) -> str:
@@ -1176,21 +1147,6 @@ def _roles_table(roles: list[dict]) -> str:
     return _table(["OpenID", "权限", "来源", "操作"], rows)
 
 
-def _limits_table(limits: list[dict]) -> str:
-    rows = [
-        "<tr>"
-        f"<td>{html.escape(item['resource'])}</td>"
-        f"<td class='numeric'>{item['limit_count']:,}</td>"
-        f"<td>{_unit_label(item['window_unit'])}</td>"
-        f"<td class='numeric'>{item['window_seconds']:,} 秒</td>"
-        f"<td>{html.escape(item.get('updated_by', '')) or '-'}</td>"
-        "</tr>"
-        for item in limits
-    ]
-    return _table(["资源", "每人次数", "周期", "窗口时长", "更新人"], rows, numeric={1, 3})
-
-
-
 def _ads_table(ads: list[dict]) -> str:
     rows = []
     for ad in ads:
@@ -1210,7 +1166,7 @@ def _ads_table(ads: list[dict]) -> str:
             "<td>"
             f"<form class='expiry-form' method='post' action='/dashboard/ads/{ad_id}/expiry'>"
             "<div class='expiry-row'>"
-            f"<input type='datetime-local' name='active_until' step='1' value='{html.escape(until_value)}'>"
+            f"<input type='datetime-local' name='active_until' aria-label='广告到期时间（北京时间）' step='1' value='{html.escape(until_value)}'>"
             "<button>保存</button>"
             "</div>"
             f"<div class='expiry-current'>当前：{html.escape(current_text)}</div>"
@@ -1252,23 +1208,6 @@ def _table(headers: list[str], rows: list[str], numeric: set[int] | None = None)
     head = "".join(f"<th scope='col' class='{'numeric' if index in (numeric or set()) else ''}'>{html.escape(item)}</th>" for index, item in enumerate(headers))
     body = "".join(rows) or f"<tr><td colspan='{len(headers)}' class='empty'>暂无数据</td></tr>"
     return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
-
-
-def _limit_form() -> str:
-    return """
-<form class="stack-form" method="post" action="/dashboard/resource-limits">
-  <label for="rule-resource">资源类型</label>
-  <select id="rule-resource" name="resource"><option>163</option><option>4399</option><option value="nfa">NFA</option></select>
-  <div class="form-grid-2"><div><label for="rule-count">每人可获取次数</label><input id="rule-count" name="limit_count" type="number" min="1" max="1000000" value="1" required></div>
-  <div><label for="rule-window">滚动周期</label><select id="rule-window" name="window_unit"><option value="min">1 分钟</option><option value="hour">1 小时</option><option value="day">1 天</option><option value="month">30 天</option><option value="quarter">90 天</option><option value="year">365 天</option></select></div></div>
-  <p class="field-note">保存后立即生效，不清空已有获取记录。</p>
-  <button type="submit">保存限制规则</button>
-</form>
-<details class="mc-reset"><summary>重置所有获取记录</summary>
-  <p class="field-note">清空全部资源的历史用量。此操作不可撤销，所有用户将重新获得额度。</p>
-  <form class="inline-form" method="post" action="/dashboard/resource-limits/reset-usage" data-confirm="确定清空全部资源的获取记录？所有用户额度会重置，此操作不可撤销。">
-  <button class="danger" type="submit">重置获取记录</button></form>
-</details>"""
 
 
 def _role_form() -> str:

@@ -9,8 +9,47 @@ UNITS = {"min": "分钟", "hour": "小时", "day": "天", "month": "30 天", "qu
 NAMES = {"163": "163 小号", "4399": "4399 账号", "nfa": "NFA Token"}
 
 
+def resource_list(stats):
+    rows = []
+    for item in stats:
+        resource = item['resource']
+        rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], "")}' if item['limit_count'] else '未设置限额'
+        rows.append(f'''<div class="mc-resource-row">
+          <div class="mc-resource-title"><h3>{esc(NAMES[resource])}</h3><p>个人限额 · {esc(rule)}</p></div>
+          <div class="mc-resource-count"><strong>{item['counts']['day']:,}</strong><small>近 24 小时获取</small></div>
+          <a class="button ghost" href="/dashboard/limits?resource={resource}">查看用量<span class="sr-only"> · {esc(NAMES[resource])}</span></a>
+        </div>''')
+    return '<div class="mc-resource-list">' + ''.join(rows) + '</div>'
+
+
+def rule_list(stats, form=None):
+    form = form or {}
+    rows = []
+    for item in stats:
+        resource = item['resource']
+        editing = form.get('resource') == resource
+        count = form.get('limit_count', item['limit_count'] or 1) if editing else item['limit_count'] or 1
+        unit = form.get('window_unit', item['window_unit'] or 'day') if editing else item['window_unit'] or 'day'
+        rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], "")}' if item['limit_count'] else '未设置'
+        options = ''.join(f'<option value="{key}"{" selected" if key == unit else ""}>{label}</option>' for key, label in [('min','1 分钟'),('hour','1 小时'),('day','1 天'),('month','30 天'),('quarter','90 天'),('year','365 天')])
+        rows.append(f'''<details class="mc-rule" id="rule-{resource}"{' open' if editing else ''}>
+          <summary><span class="mc-resource-title"><strong>{esc(NAMES[resource])}</strong></span><span class="mc-rule-value">{esc(rule)}</span><span class="mc-edit-label">编辑规则</span></summary>
+          <form class="mc-rule-form" method="post" action="/dashboard/resource-limits">
+            <input type="hidden" name="resource" value="{resource}">
+            <div><label for="count-{resource}">每人可获取次数</label><input id="count-{resource}" name="limit_count" type="number" min="1" max="1000000" value="{esc(count)}" required></div>
+            <div><label for="window-{resource}">滚动周期</label><select id="window-{resource}" name="window_unit">{options}</select></div>
+            <button type="submit">保存规则<span class="sr-only"> · {esc(NAMES[resource])}</span></button>
+          </form>
+        </details>''')
+    return '<div class="mc-rule-list">' + ''.join(rows) + '</div>'
+
+
 def esc(value):
     return html.escape(str(value), quote=True)
+
+
+def short_time(value):
+    return value[5:10] + ' ' + value[11:] if len(value) >= 19 else value
 
 
 def usage_summary(stats):
@@ -24,17 +63,6 @@ def usage_summary(stats):
                     + f'<td>{rule}<span class="cell-note">每位用户</span></td></tr>')
     headers = '<th scope="col">资源</th>' + ''.join(f'<th class="numeric" scope="col">{label}</th>' for _, label in RANGES) + '<th scope="col">个人限额</th>'
     return f'<div class="table-wrap"><table class="usage-summary-table"><caption class="sr-only">全部用户的滚动时间窗口获取次数与个人限额</caption><thead><tr>{headers}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
-
-
-def comparison_bars(stats):
-    maximum = max([item["counts"].get("day", 0) for item in stats] + [1])
-    rows = []
-    for item in stats:
-        count = int(item["counts"].get("day", 0))
-        rows.append(f'<div class="comparison-row"><span>{esc(item["resource"].upper())}</span>'
-                    f'<div class="comparison-track" aria-hidden="true"><span style="--bar-width:{count / maximum * 100:.2f}%"></span></div>'
-                    f'<strong>{count:,}<small> 次</small></strong></div>')
-    return '<div class="comparison-bars">' + ''.join(rows) + '</div>'
 
 
 def duration(seconds):
@@ -61,14 +89,14 @@ def user_usage_table(result):
           <progress value="{min(used, limit)}" max="{limit}" aria-label="{user} 已用 {used} 次，限额 {limit} 次"></progress></div></td>
           <td class="numeric">{item['remaining']:,}</td>
           <td><span class="status-label{klass}">{status}</span></td>
-          <td>{duration(item['reset_after'])}<span class="cell-note">最早一条记录释放</span></td>
-          <td class="numeric">{esc(item['latest'][5:])}<span class="cell-note">北京时间</span></td>
+          <td>{duration(item['reset_after'])}</td>
+          <td class="numeric">{esc(short_time(item['latest']))}</td>
         </tr>''')
     if not rows:
         rows.append('<tr><td colspan="7" class="empty">当前筛选下暂无有效用量。<span class="cell-note">用户成功获取资源后，会在对应的限额周期内显示。</span></td></tr>')
     return '''<div class="table-wrap"><table><caption class="sr-only">每位用户在当前滚动限额周期内的用量</caption>
     <thead><tr><th scope="col">用户 OpenID</th><th scope="col">资源 / 周期</th><th scope="col" class="numeric">已用 / 限额</th>
-    <th scope="col" class="numeric">剩余次数</th><th scope="col">状态</th><th scope="col">下次释放</th><th scope="col" class="numeric">最近获取</th></tr></thead>
+    <th scope="col" class="numeric">剩余次数</th><th scope="col">状态</th><th scope="col">下次释放</th><th scope="col" class="numeric">最近获取 · 北京时间</th></tr></thead>
     <tbody>''' + ''.join(rows) + '</tbody></table></div>'
 
 

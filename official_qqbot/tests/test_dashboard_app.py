@@ -459,6 +459,32 @@ class DashboardAppTests(unittest.TestCase):
         self.assertIn("限制规则已保存", valid.text)
         self.assertEqual(self.app.state.control_service.get_resource_limit('163')['limit_count'], 5)
 
+    def test_rule_view_prefills_current_values_and_retains_invalid_input(self):
+        self._login()
+        self.app.state.control_service.set_resource_limit("4399", 27, "hour")
+        usage = self.client.get('/dashboard/limits').text
+        self.assertNotIn('id="count-4399"', usage)
+        rules = self.client.get('/dashboard/limits?view=rules').text
+        self.assertIn('value="27"', rules)
+        self.assertIn('<option value="hour" selected>', rules)
+        self.assertNotIn('id="usage-query"', rules)
+        invalid = self.client.post('/dashboard/resource-limits', data={"resource": "4399", "limit_count": "0", "window_unit": "hour"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn('id="rule-4399" open', invalid.text)
+        self.assertIn('value="0"', invalid.text)
+        self.assertEqual(self.app.state.control_service.get_resource_limit('4399')['limit_count'], 27)
+
+    def test_log_view_selects_one_record_type_and_handles_unknown_view(self):
+        self._login()
+        service = self.app.state.control_service
+        with patch.object(service, 'list_command_logs', return_value=[]) as commands, patch.object(service, 'list_audit_logs', return_value=[]) as audit:
+            response = self.client.get('/dashboard/logs?view=audit')
+            self.assertEqual(response.status_code, 200)
+            audit.assert_called_once_with(limit=50)
+            commands.assert_not_called()
+            self.client.get('/dashboard/logs?view=unknown')
+            commands.assert_called_once_with(limit=50)
+
     def test_dashboard_can_ban_user(self):
         self.client.post(
             "/dashboard/login",
