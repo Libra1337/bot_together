@@ -409,70 +409,55 @@ class DashboardAppTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("已记录 501 个 OpenID", resp.text)
 
-    def test_dashboard_css_has_motion_and_interactive_polish(self):
-        self.client.post(
-            "/dashboard/login",
-            content="token=admin-token",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+    def test_dashboard_has_accessible_navigation_and_responsive_shell(self):
+        self._login()
+        text = self.client.get("/dashboard").text
+        self.assertIn('aria-current="page"', text)
+        self.assertIn('aria-expanded="false"', text)
+        self.assertIn('prefers-reduced-motion', text)
+        self.assertIn(':focus-visible', text)
+        self.assertEqual(text.count('<h1'), 1)
 
-        resp = self.client.get("/dashboard")
-
-        self.assertIn("@keyframes consoleEnter", resp.text)
-        self.assertIn("animation: consoleEnter", resp.text)
-        self.assertIn(".panel:hover", resp.text)
-        self.assertIn("button:hover", resp.text)
-        self.assertIn("input:focus", resp.text)
-        self.assertIn("transition: transform", resp.text)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", resp.text)
-
-    def test_limits_dashboard_renders_touchable_usage_chart(self):
-        self.client.post(
-            "/dashboard/login",
-            content="token=admin-token",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+    def test_limits_dashboard_shows_totals_and_personal_quotas_separately(self):
+        self._login()
         service = self.app.state.control_service
         service.set_resource_limit("163", 3, "day", updated_by="admin")
         service.record_resource_usage("163", "user-a")
+        text = self.client.get("/dashboard/limits").text
+        self.assertIn("资源用量总览", text)
+        self.assertIn("用户用量明细", text)
+        self.assertIn("近 24 小时", text)
+        self.assertIn("不能相加", text)
+        self.assertIn("1 / 3", text)
+        self.assertIn("可继续获取", text)
+        self.assertIn("最早一条记录释放", text)
+        self.assertNotIn('data-chart-type', text)
 
-        resp = self.client.get("/dashboard/limits")
-
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("实时获取统计", resp.text)
-        self.assertIn("usage-chart", resp.text)
-        self.assertIn("data-tooltip", resp.text)
-        self.assertIn("秒", resp.text)
-        self.assertIn("分钟", resp.text)
-        self.assertIn("小时", resp.text)
-        self.assertIn("天", resp.text)
-        self.assertIn("月", resp.text)
-        self.assertIn("年", resp.text)
-        self.assertIn("touchstart", resp.text)
-
-    def test_limits_dashboard_supports_switchable_chart_types(self):
-        self.client.post(
-            "/dashboard/login",
-            content="token=admin-token",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+    def test_limits_filters_are_server_rendered_and_escape_user_input(self):
+        self._login()
         service = self.app.state.control_service
-        service.set_resource_limit("163", 3, "day", updated_by="admin")
+        service.set_resource_limit("163", 1, "day")
+        service.set_resource_limit("4399", 1, "day")
         service.record_resource_usage("163", "user-a")
+        service.record_resource_usage("4399", "user-b")
+        response = self.client.get("/dashboard/limits?resource=163&q=user-a")
+        self.assertIn("user-a", response.text)
+        self.assertNotIn("user-b", response.text)
+        self.assertIn("已达限额", response.text)
+        response = self.client.get('/dashboard/limits', params={"q": '<script>alert(1)</script>', "page": "bad"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('<script>alert(1)</script>', response.text)
+        self.assertIn("暂无有效用量", response.text)
 
-        resp = self.client.get("/dashboard/limits")
-
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("data-chart-type='line'", resp.text)
-        self.assertIn("data-chart-type='pie'", resp.text)
-        self.assertIn("data-chart-type='radar'", resp.text)
-        self.assertIn("data-chart-type='bar'", resp.text)
-        self.assertIn("chart-tab is-active", resp.text)
-        self.assertIn("折线图", resp.text)
-        self.assertIn("饼状图", resp.text)
-        self.assertIn("雷达图", resp.text)
-        self.assertIn("柱状图", resp.text)
-        self.assertIn("switchChart", resp.text)
+    def test_limits_form_validates_and_persists(self):
+        self._login()
+        invalid = self.client.post('/dashboard/resource-limits', data={"resource": "163", "limit_count": "abc", "window_unit": "day"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn('role="alert"', invalid.text)
+        valid = self.client.post('/dashboard/resource-limits', data={"resource": "163", "limit_count": "5", "window_unit": "hour"})
+        self.assertEqual(valid.status_code, 200)
+        self.assertIn("限制规则已保存", valid.text)
+        self.assertEqual(self.app.state.control_service.get_resource_limit('163')['limit_count'], 5)
 
     def test_dashboard_can_ban_user(self):
         self.client.post(

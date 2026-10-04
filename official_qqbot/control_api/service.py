@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.engine import Engine
 
 from .db import session_scope
@@ -318,40 +318,68 @@ class ControlService:
         now = self._aware_utc(now or utc_now())
         limits = {row["resource"]: row for row in self.list_resource_limits()}
         with session_scope(self.engine) as session:
-            rows = session.scalars(
-                select(ResourceUsage).where(
-                    ResourceUsage.used_at >= now - timedelta(seconds=RESOURCE_STATS_WINDOWS["year"])
-                )
-            ).all()
+            rows = session.execute(select(
+                ResourceUsage.resource,
+                *[func.sum(case((ResourceUsage.used_at >= now - timedelta(seconds=seconds), 1), else_=0)).label(key)
+                  for key, seconds in RESOURCE_STATS_WINDOWS.items()],
+            ).where(
+                ResourceUsage.used_at >= now - timedelta(days=365),
+                ResourceUsage.used_at <= now,
+            ).group_by(ResourceUsage.resource)).mappings().all()
+        counts_by_resource = {row["resource"]: row for row in rows}
+        return [{
+            "resource": resource,
+            "limit_count": int(limits.get(resource, {}).get("limit_count", 0)),
+            "window_unit": limits.get(resource, {}).get("window_unit", ""),
+            "window_seconds": int(limits.get(resource, {}).get("window_seconds", 0)),
+            "counts": {key: int(counts_by_resource.get(resource, {}).get(key, 0) or 0)
+                       for key in RESOURCE_STATS_WINDOWS},
+        } for resource in sorted(RESOURCE_NAMES)]
 
-        stats = []
-        for resource in sorted(RESOURCE_NAMES):
-            rule = limits.get(resource)
-            if not rule:
-                continue
-            resource_rows = [
-                row
-                for row in rows
-                if row.resource == resource
-            ]
-            counts = {
-                key: sum(
-                    1
-                    for row in resource_rows
-                    if now - self._aware_utc(row.used_at) <= timedelta(seconds=seconds)
-                )
-                for key, seconds in RESOURCE_STATS_WINDOWS.items()
-            }
-            stats.append(
-                {
-                    "resource": resource,
-                    "limit_count": int(rule["limit_count"]),
-                    "window_unit": rule["window_unit"],
-                    "window_seconds": int(rule["window_seconds"]),
-                    "counts": counts,
-                }
-            )
-        return stats
+    def list_resource_user_usage(self, *, resource: str = "", query: str = "",
+                                 page: int = 1, page_size: int = 20,
+                                 now: datetime | None = None) -> dict:
+        """Aggregate each user's own rolling quota, with bounded SQL pagination."""
+        now = self._aware_utc(now or utc_now())
+        rules = {item["resource"]: item for item in self.list_resource_limits()}
+        selected = [item for name, item in rules.items() if not resource or name == resource]
+        page_size = min(100, max(1, int(page_size)))
+        if not selected:
+            return {"items": [], "total": 0, "page": 1, "pages": 1}
+        window_filter = or_(*[and_(
+            ResourceUsage.resource == item["resource"],
+            ResourceUsage.used_at >= now - timedelta(seconds=item["window_seconds"]),
+        ) for item in selected])
+        grouped = select(
+            ResourceUsage.resource, ResourceUsage.user_key,
+            func.count(ResourceUsage.id).label("used"),
+            func.min(ResourceUsage.used_at).label("oldest"),
+            func.max(ResourceUsage.used_at).label("latest"),
+        ).where(window_filter, ResourceUsage.used_at <= now)
+        if query:
+            grouped = grouped.where(ResourceUsage.user_key.contains(query, autoescape=True))
+        grouped = grouped.group_by(ResourceUsage.resource, ResourceUsage.user_key).subquery()
+        with session_scope(self.engine) as session:
+            total = session.scalar(select(func.count()).select_from(grouped)) or 0
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = min(pages, max(1, int(page)))
+            rows = session.execute(select(grouped).order_by(
+                grouped.c.used.desc(), grouped.c.resource, grouped.c.user_key,
+            ).offset((page - 1) * page_size).limit(page_size)).mappings().all()
+        items = []
+        for row in rows:
+            rule = rules[row["resource"]]
+            reset_at = self._aware_utc(row["oldest"]) + timedelta(seconds=rule["window_seconds"])
+            items.append({
+                "resource": row["resource"], "user_key": row["user_key"],
+                "used": int(row["used"]), "limit": rule["limit_count"],
+                "remaining": max(0, rule["limit_count"] - row["used"]),
+                "blocked": row["used"] >= rule["limit_count"],
+                "window_unit": rule["window_unit"],
+                "reset_after": max(0, int((reset_at - now).total_seconds())),
+                "latest": format_beijing_datetime(row["latest"]),
+            })
+        return {"items": items, "total": total, "page": page, "pages": pages}
 
     def record_resource_usage(
         self,

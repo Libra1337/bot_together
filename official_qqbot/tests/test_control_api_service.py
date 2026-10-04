@@ -72,6 +72,42 @@ class ControlApiServiceTests(unittest.TestCase):
         self.assertEqual(row["counts"]["day"], 3)
         self.assertEqual(row["limit_count"], 10)
 
+    def test_usage_summary_includes_unconfigured_resources_and_excludes_future_records(self):
+        now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        self.service.record_resource_usage("nfa", "user", used_at=now)
+        self.service.record_resource_usage("nfa", "user", used_at=now + timedelta(seconds=1))
+        stats = self.service.list_resource_usage_stats(now=now)
+        self.assertEqual(len(stats), 3)
+        nfa = next(row for row in stats if row["resource"] == "nfa")
+        self.assertEqual(nfa["counts"]["day"], 1)
+        self.assertEqual(nfa["limit_count"], 0)
+
+    def test_user_usage_uses_each_rules_window_and_own_quota(self):
+        now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        self.service.set_resource_limit("163", 2, "hour")
+        self.service.set_resource_limit("4399", 1, "day")
+        for minute in (10, 20, 61):
+            self.service.record_resource_usage("163", "user-a", used_at=now - timedelta(minutes=minute))
+        self.service.record_resource_usage("163", "user-b", used_at=now)
+        self.service.record_resource_usage("4399", "user-a", used_at=now - timedelta(hours=2))
+        result = self.service.list_resource_user_usage(now=now)
+        a = next(row for row in result["items"] if row["user_key"] == "user-a" and row["resource"] == "163")
+        self.assertEqual((a["used"], a["remaining"], a["blocked"], a["reset_after"]), (2, 0, True, 2400))
+        b = next(row for row in result["items"] if row["user_key"] == "user-b")
+        self.assertEqual((b["used"], b["remaining"], b["blocked"]), (1, 1, False))
+        self.assertEqual(result["total"], 3)
+
+    def test_user_usage_filters_paginates_and_escapes_like_wildcards(self):
+        now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        self.service.set_resource_limit("163", 2, "hour")
+        for user in ("user-a", "user-b", "user-%"):
+            self.service.record_resource_usage("163", user, used_at=now)
+        result = self.service.list_resource_user_usage(now=now, page=2, page_size=2)
+        self.assertEqual((result["total"], result["page"], len(result["items"])), (3, 2, 1))
+        filtered = self.service.list_resource_user_usage(now=now, query="%")
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["items"][0]["user_key"], "user-%")
+
 
 if __name__ == "__main__":
     unittest.main()

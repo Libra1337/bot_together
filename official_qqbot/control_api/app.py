@@ -6,7 +6,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -15,6 +15,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .ai_config import AIConfigManager, AISettings
 from .auth import require_admin_token, require_bot_token
 from .db import create_app_engine, init_db
+from .dashboard_ui import render_layout, render_login
+from . import dashboard_usage as usage_ui
 from .image_ai_config import IMAGE_SIZES, ImageAIConfigManager, ImageAISettings
 from .schemas import (
     BanRequest,
@@ -293,7 +295,7 @@ def create_app(
         auth = _dashboard_auth_redirect(request, dashboard_secret)
         if auth:
             return auth
-        return HTMLResponse(_limits_page(service))
+        return HTMLResponse(_limits_page(service, request.query_params))
 
     @app.get("/dashboard/logs", response_class=HTMLResponse)
     def dashboard_logs(request: Request):
@@ -620,13 +622,17 @@ def create_app(
         if auth:
             return auth
         form = await _read_urlencoded_form(request)
-        service.set_resource_limit(
-            form.get("resource", ""),
-            int(form.get("limit_count", "0")),
-            form.get("window_unit", ""),
-            updated_by="dashboard",
-        )
-        return RedirectResponse("/dashboard/limits", status_code=303)
+        try:
+            count = int(form.get("limit_count", "0"))
+            if not 1 <= count <= 1000000:
+                raise ValueError("invalid limit")
+            service.set_resource_limit(
+                form.get("resource", ""), count, form.get("window_unit", ""),
+                updated_by="dashboard",
+            )
+        except (ValueError, TypeError):
+            return HTMLResponse(_limits_page(service, error="请输入 1–1,000,000 之间的次数，并选择有效的资源和周期。"), status_code=400)
+        return RedirectResponse("/dashboard/limits?saved=1", status_code=303)
 
     @app.post("/dashboard/resource-limits/reset-usage")
     def dashboard_reset_resource_usage(request: Request):
@@ -884,28 +890,7 @@ def _image_ai_page(
 
 
 def _login_html(error: str = "") -> str:
-    error_html = f"<p class='error'>{html.escape(error)}</p>" if error else ""
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Miracle 控制台登录</title>
-  <style>{_DASHBOARD_CSS}</style>
-</head>
-<body class="login-body">
-  <main class="login-panel">
-    <div class="brand-line">MIRACLE BOT</div>
-    <h1>控制台登录</h1>
-    <form method="post" action="/dashboard/login">
-      <label>管理密钥</label>
-      <input name="token" type="password" autocomplete="current-password" autofocus>
-      <button type="submit">登录</button>
-    </form>
-    {error_html}
-  </main>
-</body>
-</html>"""
+    return render_login(error)
 
 
 def _overview_page(service: ControlService) -> str:
@@ -914,13 +899,25 @@ def _overview_page(service: ControlService) -> str:
     limits = service.list_resource_limits()
     ads = _read_ads()
     counts = _counts(users, roles)
+    stats = service.list_resource_usage_stats()
+    total = sum(item["counts"]["day"] for item in stats)
+    recent = service.list_command_logs(limit=5)
+    recent_html = "".join(
+        f'<div><strong>{html.escape(item.get("command", ""))}</strong><span>{html.escape(item.get("created_at", ""))}</span></div>'
+        for item in recent
+    ) or '<div class="empty">暂无命令记录<span class="cell-note">用户调用机器人后，最近活动会显示在这里。</span></div>'
     body = f"""
     <section class="metrics">
-      {_metric("用户", counts["users"])}
-      {_metric("管理员", counts["admins"])}
-      {_metric("Staff", counts["staff"])}
-      {_metric("封禁", counts["banned"])}
+      {_metric("已记录用户", counts["users"], "跨群与私聊")}
+      {_metric("近 24 小时获取", total, "全部资源 · 次")}
+      {_metric("管理成员", counts["admins"] + counts["staff"], f"管理员 {counts['admins']} · Staff {counts['staff']}")}
+      {_metric("已封禁用户", counts["banned"], "当前限制状态")}
     </section>
+    <section class="mc-limit-grid">
+      <div class="panel"><div class="panel-head"><div><h2>资源获取概况</h2><p class="cell-note">近 24 小时 · 全部用户成功获取次数</p></div><a href="/dashboard/limits">查看用量明细 →</a></div>{usage_ui.comparison_bars(stats)}</div>
+      <div class="panel"><div class="panel-head"><h2>最近命令</h2><a href="/dashboard/logs">全部日志 →</a></div><div class="mc-recent-list">{recent_html}</div></div>
+    </section>
+    <div class="mc-section-head"><h2>管理工作区</h2><span>常用配置与操作</span></div>
     <section class="grid">
       {_quick_card("广告管理", f"共 {len(ads)} 条，启用 {len([a for a in ads if a.get('enabled')])} 条", "/dashboard/ads")}
       {_quick_card("用户列表", f"已记录 {counts['users']} 个 OpenID", "/dashboard/users")}
@@ -1002,23 +999,52 @@ def _bans_page(service: ControlService) -> str:
     return _layout("封禁名单", "bans", body)
 
 
-def _limits_page(service: ControlService) -> str:
+def _limits_page(service: ControlService, params=None, error: str = "") -> str:
+    params = params or {}
+    resource = str(params.get("resource", ""))
+    if resource not in {"163", "4399", "nfa"}:
+        resource = ""
+    query = str(params.get("q", ""))[:128].strip()
+    try:
+        page = max(1, int(params.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
+    now = datetime.now(timezone.utc)
     limits = service.list_resource_limits()
-    stats = service.list_resource_usage_stats()
+    stats = service.list_resource_usage_stats(now=now)
+    users = service.list_resource_user_usage(resource=resource, query=query, page=page, now=now)
+    notices = f'<div class="notice error" role="alert">{html.escape(error)}</div>' if error else ""
+    if params.get("saved") == "1":
+        notices += '<div class="notice success" role="status">限制规则已保存，对所有群和私聊生效。</div>'
+    total_day = sum(item["counts"]["day"] for item in stats)
+    total_hour = sum(item["counts"]["hour"] for item in stats)
     body = f"""
-    <section class="grid">
-      <div class="panel">
-        <div class="panel-head"><h2>获取限制</h2><span>所有群全局生效</span></div>
+    {notices}
+    <div class="mc-page-actions"><a class="button ghost" href="/dashboard/limits?{html.escape(urlencode({'resource': resource, 'q': query, 'page': page}))}">刷新数据</a><a class="button" href="#rule-editor">调整限制</a></div>
+    <section class="metrics" aria-label="用量摘要">
+      {_metric("近 24 小时获取", total_day, "全部用户 · 次")}
+      {_metric("近 1 小时获取", total_hour, "全部用户 · 次")}
+      {_metric("已配置规则", len(limits), "按用户独立计数")}
+      {_metric("当前筛选用户用量", users['total'], "用户与资源组合 · 条")}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>资源用量总览</h2><p class="cell-note">各时间窗口内的成功获取次数，覆盖全部用户。</p></div><span>滚动窗口统计</span></div>
+      {usage_ui.usage_summary(stats)}
+      <p class="mc-section-note">时间窗口互有重叠，不能相加。全体获取次数不代表单个用户已使用的额度。</p>
+    </section>
+    <section class="panel" id="user-usage">
+      <div class="panel-head"><div><h2>用户用量明细</h2><p class="cell-note">按每位用户的限额周期计算；跨群、私聊共用额度。</p></div><span>当前有效记录</span></div>
+      {usage_ui.filters(resource, query)}
+      {usage_ui.user_usage_table(users)}
+      {usage_ui.pagination(users, resource, query)}
+    </section>
+    <section class="mc-limit-grid">
+      <div class="panel"><div class="panel-head"><div><h2>限制规则</h2><p class="cell-note">数量为每位用户在滚动周期内可获取的次数。</p></div></div>
         {_limits_table(limits)}
+        <div class="mc-section-head"><h2>近 24 小时资源对比</h2><span>全部用户 · 次</span></div>
+        {usage_ui.comparison_bars(stats)}
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>设置限制</h2><span>/restrict 163/4399/nfa 数量 时间</span></div>
-        {_limit_form()}
-      </div>
-      <div class="panel span-2">
-        <div class="panel-head"><h2>实时获取统计</h2><span>秒 / 分钟 / 小时 / 天 / 月 / 年</span></div>
-        {_usage_charts(stats)}
-      </div>
+      <div class="panel" id="rule-editor"><div class="panel-head"><h2>调整限制</h2></div>{_limit_form()}</div>
     </section>
     """
     return _layout("获取限制", "limits", body)
@@ -1065,49 +1091,7 @@ def _settings_page(service: ControlService) -> str:
 
 
 def _layout(title: str, active: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Miracle Bot {html.escape(title)}</title>
-  <style>{_DASHBOARD_CSS}</style>
-</head>
-<body>
-  <aside class="sidebar">
-    <div class="brand"><span class="brand-dot"></span>MIRACLE</div>
-    <nav>
-      {_nav_link("overview", "/dashboard", "控制台", active)}
-      {_nav_link("ads", "/dashboard/ads", "广告管理", active)}
-      {_nav_link("users", "/dashboard/users", "用户列表", active)}
-      {_nav_link("permissions", "/dashboard/permissions", "权限管理", active)}
-      {_nav_link("bans", "/dashboard/bans", "封禁名单", active)}
-      {_nav_link("limits", "/dashboard/limits", "获取限制", active)}
-      {_nav_link("logs", "/dashboard/logs", "日志审计", active)}
-      {_nav_link("settings", "/dashboard/settings", "系统设置", active)}
-      {_nav_link("ai", "/dashboard/ai", "AI 对话", active)}
-      {_nav_link("image-ai", "/dashboard/image-ai", "AI 生图", active)}
-    </nav>
-  </aside>
-  <main class="console">
-    <header class="page-head">
-      <div>
-        <p class="eyebrow">CONTROL CONSOLE</p>
-        <h1>{html.escape(title)}</h1>
-      </div>
-      <div class="status">云端同步</div>
-      <form method="post" action="/dashboard/logout"><button class="ghost">退出登录</button></form>
-    </header>
-    {body}
-  </main>
-  <script>{_DASHBOARD_JS}</script>
-</body>
-</html>"""
-
-
-def _nav_link(key: str, href: str, label: str, active: str) -> str:
-    klass = "active" if key == active else ""
-    return f'<a class="{klass}" href="{href}">{html.escape(label)}</a>'
+    return render_layout(title, active, body)
 
 
 def _counts(users: list[dict], roles: list[dict]) -> dict:
@@ -1123,8 +1107,8 @@ def _list_all_users(service: ControlService) -> list[dict]:
     return service.list_users(limit=None)
 
 
-def _metric(label: str, value: int) -> str:
-    return f"<div class='metric'><span>{html.escape(label)}</span><strong>{value}</strong></div>"
+def _metric(label: str, value: int, note: str = "") -> str:
+    return f"<div class='metric'><span>{html.escape(label)}</span><strong>{value:,}</strong><small>{html.escape(note)}</small></div>"
 
 
 def _quick_card(title: str, subtitle: str, href: str) -> str:
@@ -1196,182 +1180,15 @@ def _limits_table(limits: list[dict]) -> str:
     rows = [
         "<tr>"
         f"<td>{html.escape(item['resource'])}</td>"
-        f"<td>{item['limit_count']}</td>"
+        f"<td class='numeric'>{item['limit_count']:,}</td>"
         f"<td>{_unit_label(item['window_unit'])}</td>"
-        f"<td>{item['window_seconds']} 秒</td>"
+        f"<td class='numeric'>{item['window_seconds']:,} 秒</td>"
         f"<td>{html.escape(item.get('updated_by', '')) or '-'}</td>"
         "</tr>"
         for item in limits
     ]
-    return _table(["资源", "数量", "周期", "秒数", "更新人"], rows)
+    return _table(["资源", "每人次数", "周期", "窗口时长", "更新人"], rows, numeric={1, 3})
 
-
-def _usage_charts(stats: list[dict]) -> str:
-    if not stats:
-        return "<div class='empty'>暂无获取记录</div>"
-    labels = [
-        ("second", "秒"),
-        ("minute", "分钟"),
-        ("hour", "小时"),
-        ("day", "天"),
-        ("month", "月"),
-        ("year", "年"),
-    ]
-    cards = []
-    for item in stats:
-        counts = item.get("counts", {}) or {}
-        values = [int(counts.get(key, 0) or 0) for key, _ in labels]
-        max_value = max(values + [1])
-        resource = html.escape(str(item["resource"]))
-        cards.append(
-            "<article class='usage-card'>"
-            "<div class='usage-card-head'>"
-            f"<strong>{resource}</strong>"
-            f"<span>上限 {int(item.get('limit_count', 0) or 0)} / {_unit_label(str(item.get('window_unit', '')))}</span>"
-            "</div>"
-            "<div class='chart-tabs' role='tablist' aria-label='图表类型'>"
-            "<button type='button' class='chart-tab is-active' data-chart-type='line'>折线图</button>"
-            "<button type='button' class='chart-tab' data-chart-type='pie'>饼状图</button>"
-            "<button type='button' class='chart-tab' data-chart-type='radar'>雷达图</button>"
-            "<button type='button' class='chart-tab' data-chart-type='bar'>柱状图</button>"
-            "</div>"
-            "<div class='usage-chart'>"
-            f"{_line_chart(resource, labels, values, max_value)}"
-            f"{_pie_chart(resource, labels, values)}"
-            f"{_radar_chart(resource, labels, values, max_value)}"
-            f"{_bar_chart(resource, labels, values, max_value)}"
-            "</div>"
-            "</article>"
-        )
-    return f"<div class='usage-grid'>{''.join(cards)}</div>"
-
-
-def _line_chart(resource: str, labels: list[tuple[str, str]], values: list[int], max_value: int) -> str:
-    width = 320
-    height = 180
-    left = 26
-    top = 18
-    chart_w = 268
-    chart_h = 106
-    points = []
-    dots = []
-    for idx, ((_, label), value) in enumerate(zip(labels, values)):
-        x = left + (chart_w / (len(values) - 1)) * idx
-        y = top + chart_h - (value / max_value * chart_h if max_value else 0)
-        points.append(f"{x:.1f},{y:.1f}")
-        tooltip = html.escape(f"{resource} {label}内获取 {value} 次")
-        dots.append(
-            f"<button type='button' class='chart-point' style='--point-x:{x / width * 100:.2f}%;--point-y:{y / height * 100:.2f}%' data-tooltip='{tooltip}' aria-label='{tooltip}'><span>{value}</span></button>"
-        )
-    x_labels = "".join(
-        f"<text x='{left + (chart_w / (len(labels) - 1)) * idx:.1f}' y='160' text-anchor='middle'>{html.escape(label)}</text>"
-        for idx, (_, label) in enumerate(labels)
-    )
-    return (
-        "<div class='chart-pane is-active' data-chart-type='line'>"
-        "<div class='chart-stage'>"
-        f"<svg class='line-svg' viewBox='0 0 {width} {height}' role='img' aria-label='{resource} 折线图'>"
-        "<line x1='26' y1='124' x2='294' y2='124' class='chart-axis' />"
-        "<line x1='26' y1='18' x2='26' y2='124' class='chart-axis' />"
-        f"<polyline points='{' '.join(points)}' class='chart-line' />"
-        f"{x_labels}"
-        "</svg>"
-        f"{''.join(dots)}"
-        "</div>"
-        "</div>"
-    )
-
-
-def _pie_chart(resource: str, labels: list[tuple[str, str]], values: list[int]) -> str:
-    total = sum(values)
-    if total <= 0:
-        total = 1
-    colors = ["#2563eb", "#0f766e", "#7c3aed", "#ea580c", "#dc2626", "#475569"]
-    gradient_parts = []
-    cursor = 0.0
-    legend = []
-    for idx, ((_, label), value) in enumerate(zip(labels, values)):
-        percent = value / total * 100
-        start = cursor
-        cursor += percent
-        color = colors[idx % len(colors)]
-        gradient_parts.append(f"{color} {start:.2f}% {cursor:.2f}%")
-        tooltip = html.escape(f"{resource} {label}内获取 {value} 次")
-        legend.append(
-            f"<button type='button' class='pie-legend-item chart-hotspot' data-tooltip='{tooltip}' aria-label='{tooltip}'><span style='background:{color}'></span>{html.escape(label)} {value}</button>"
-        )
-    return (
-        "<div class='chart-pane' data-chart-type='pie'>"
-        "<div class='pie-layout'>"
-        f"<div class='pie-visual' style='background: conic-gradient({', '.join(gradient_parts)})'></div>"
-        f"<div class='pie-legend'>{''.join(legend)}</div>"
-        "</div>"
-        "</div>"
-    )
-
-
-def _radar_chart(resource: str, labels: list[tuple[str, str]], values: list[int], max_value: int) -> str:
-    import math
-
-    cx = 160
-    cy = 88
-    radius = 62
-    axis_lines = []
-    label_nodes = []
-    points = []
-    hotspots = []
-    for idx, ((_, label), value) in enumerate(zip(labels, values)):
-        angle = -math.pi / 2 + idx * (2 * math.pi / len(labels))
-        outer_x = cx + math.cos(angle) * radius
-        outer_y = cy + math.sin(angle) * radius
-        axis_lines.append(f"<line x1='{cx}' y1='{cy}' x2='{outer_x:.1f}' y2='{outer_y:.1f}' class='radar-axis' />")
-        label_x = cx + math.cos(angle) * (radius + 20)
-        label_y = cy + math.sin(angle) * (radius + 20)
-        label_nodes.append(f"<text x='{label_x:.1f}' y='{label_y:.1f}' text-anchor='middle'>{html.escape(label)}</text>")
-        scaled = radius * (value / max_value if max_value else 0)
-        x = cx + math.cos(angle) * scaled
-        y = cy + math.sin(angle) * scaled
-        points.append(f"{x:.1f},{y:.1f}")
-        tooltip = html.escape(f"{resource} {label}内获取 {value} 次")
-        hotspots.append(
-            f"<button type='button' class='chart-point' style='--point-x:{x / 320 * 100:.2f}%;--point-y:{y / 180 * 100:.2f}%' data-tooltip='{tooltip}' aria-label='{tooltip}'><span>{value}</span></button>"
-        )
-    return (
-        "<div class='chart-pane' data-chart-type='radar'>"
-        "<div class='chart-stage'>"
-        "<svg class='radar-svg' viewBox='0 0 320 180' role='img' aria-label='雷达图'>"
-        "<circle cx='160' cy='88' r='62' class='radar-ring' />"
-        "<circle cx='160' cy='88' r='38' class='radar-ring' />"
-        f"{''.join(axis_lines)}"
-        f"<polygon points='{' '.join(points)}' class='radar-area' />"
-        f"{''.join(label_nodes)}"
-        "</svg>"
-        f"{''.join(hotspots)}"
-        "</div>"
-        "</div>"
-    )
-
-
-def _bar_chart(resource: str, labels: list[tuple[str, str]], values: list[int], max_value: int) -> str:
-    bars = []
-    for (_, label), value in zip(labels, values):
-        height = max(8, round(value / max_value * 100)) if value else 6
-        tooltip = html.escape(f"{resource} {label}内获取 {value} 次")
-        bars.append(
-            "<button type='button' class='usage-bar chart-hotspot' "
-            f"style='--bar-height:{height}%' "
-            f"data-tooltip='{tooltip}' "
-            f"aria-label='{tooltip}'>"
-            "<span class='usage-bar-fill'></span>"
-            f"<span class='usage-value'>{value}</span>"
-            f"<span class='usage-label'>{html.escape(label)}</span>"
-            "</button>"
-        )
-    return (
-        "<div class='chart-pane' data-chart-type='bar'>"
-        f"<div class='bar-chart'>{''.join(bars)}</div>"
-        "</div>"
-    )
 
 
 def _ads_table(ads: list[dict]) -> str:
@@ -1431,23 +1248,27 @@ def _logs_table(items: list[dict], columns: list[str]) -> str:
     return _table([labels.get(col, col) for col in columns], rows)
 
 
-def _table(headers: list[str], rows: list[str]) -> str:
-    head = "".join(f"<th>{html.escape(item)}</th>" for item in headers)
+def _table(headers: list[str], rows: list[str], numeric: set[int] | None = None) -> str:
+    head = "".join(f"<th scope='col' class='{'numeric' if index in (numeric or set()) else ''}'>{html.escape(item)}</th>" for index, item in enumerate(headers))
     body = "".join(rows) or f"<tr><td colspan='{len(headers)}' class='empty'>暂无数据</td></tr>"
     return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
 def _limit_form() -> str:
     return """
-<form class="inline-form" method="post" action="/dashboard/resource-limits">
-  <select name="resource"><option>163</option><option>4399</option><option>nfa</option></select>
-  <input name="limit_count" type="number" min="1" value="1">
-  <select name="window_unit"><option value="min">分钟</option><option value="hour">小时</option><option value="day">天</option><option value="month">月</option><option value="quarter">季度</option><option value="year">年</option></select>
-  <button>设置限制</button>
+<form class="stack-form" method="post" action="/dashboard/resource-limits">
+  <label for="rule-resource">资源类型</label>
+  <select id="rule-resource" name="resource"><option>163</option><option>4399</option><option value="nfa">NFA</option></select>
+  <div class="form-grid-2"><div><label for="rule-count">每人可获取次数</label><input id="rule-count" name="limit_count" type="number" min="1" max="1000000" value="1" required></div>
+  <div><label for="rule-window">滚动周期</label><select id="rule-window" name="window_unit"><option value="min">1 分钟</option><option value="hour">1 小时</option><option value="day">1 天</option><option value="month">30 天</option><option value="quarter">90 天</option><option value="year">365 天</option></select></div></div>
+  <p class="field-note">保存后立即生效，不清空已有获取记录。</p>
+  <button type="submit">保存限制规则</button>
 </form>
-<form class="inline-form" method="post" action="/dashboard/resource-limits/reset-usage">
-  <button>重置获取记录</button>
-</form>"""
+<details class="mc-reset"><summary>重置所有获取记录</summary>
+  <p class="field-note">清空全部资源的历史用量。此操作不可撤销，所有用户将重新获得额度。</p>
+  <form class="inline-form" method="post" action="/dashboard/resource-limits/reset-usage" data-confirm="确定清空全部资源的获取记录？所有用户额度会重置，此操作不可撤销。">
+  <button class="danger" type="submit">重置获取记录</button></form>
+</details>"""
 
 
 def _role_form() -> str:
@@ -1638,211 +1459,6 @@ def _delete_ad(ad_id: int) -> None:
     ads = [ad for ad in _read_ads() if int(ad.get("id", 0) or 0) != int(ad_id)]
     _write_ads(ads)
 
-
-_DASHBOARD_CSS = """
-:root { color-scheme: light; font-family: Inter, Arial, "Microsoft YaHei", sans-serif; background: #f6f5f1; color: #111; }
-* { box-sizing: border-box; }
-body { margin: 0; background: #f6f5f1; }
-button, input, select, textarea { font: inherit; }
-.sidebar { position: fixed; inset: 0 auto 0 0; width: 220px; border-right: 1px solid #ddd8ce; background: #fbfaf7; padding: 22px 14px; }
-.brand { display: flex; align-items: center; gap: 8px; height: 32px; color: #666; font-size: 13px; font-weight: 800; letter-spacing: .04em; margin-bottom: 28px; }
-.brand-dot { width: 10px; height: 10px; border: 2px solid #666; border-radius: 50%; display: inline-block; transition: transform .22s ease, border-color .22s ease; }
-.brand:hover .brand-dot { transform: scale(1.18); border-color: #111; }
-nav { display: grid; gap: 7px; }
-nav a { color: #111; text-decoration: none; padding: 11px 14px; border-radius: 8px; font-weight: 700; transition: background-color .18s ease, color .18s ease, transform .18s ease; }
-nav a.active, nav a:hover { background: #050505; color: #fff; transform: translateX(2px); }
-.console { margin-left: 220px; padding: 28px 32px 60px; animation: consoleEnter .32s ease-out both; }
-.page-head { display: grid; grid-template-columns: 1fr auto auto; align-items: end; gap: 16px; margin-bottom: 20px; }
-.eyebrow { margin: 0 0 6px; color: #777; font-size: 12px; font-weight: 800; letter-spacing: .08em; }
-h1 { margin: 0; font-size: 34px; line-height: 1.1; letter-spacing: 0; }
-h2 { margin: 0; font-size: 18px; letter-spacing: 0; }
-p { margin: 0; }
-.status { color: #777; font-size: 13px; }
-.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
-.metric, .panel, .quick-card { border: 1px solid #ddd8ce; background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 0 rgba(17,17,17,.03); transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease; }
-.metric:hover, .panel:hover, .quick-card:hover { transform: translateY(-2px); border-color: #cfc8ba; box-shadow: 0 12px 28px rgba(17,17,17,.08); }
-.metric span { display: block; color: #777; font-size: 13px; }
-.metric strong { display: block; margin-top: 8px; font-size: 26px; }
-.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
-.split { display: grid; grid-template-columns: minmax(320px, 460px) minmax(0, 1fr); gap: 18px; align-items: start; }
-.span-2 { grid-column: 1 / -1; }
-.quick-card { display: block; color: #111; text-decoration: none; min-height: 126px; }
-.quick-card p { color: #666; margin-top: 10px; line-height: 1.6; }
-.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
-.panel-head span { color: #888; font-size: 13px; }
-.stack-form { display: grid; gap: 10px; }
-label { color: #555; font-size: 13px; }
-input, select, textarea { width: 100%; border: 1px solid #d8d3c8; border-radius: 8px; background: #fff; padding: 10px 12px; transition: border-color .18s ease, box-shadow .18s ease, background-color .18s ease; }
-input:focus, select:focus, textarea:focus { outline: none; border-color: #111; box-shadow: 0 0 0 3px rgba(17,17,17,.08); background: #fffefa; }
-input, select { height: 38px; }
-textarea { min-height: 150px; resize: vertical; }
-.check { display: flex; align-items: center; gap: 8px; }
-.check input { width: auto; height: auto; }
-button { height: 36px; border: 0; border-radius: 8px; background: #050505; color: #fff; padding: 0 14px; cursor: pointer; font-weight: 700; white-space: nowrap; transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease, border-color .16s ease; }
-button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(17,17,17,.14); }
-button:active { transform: translateY(0); box-shadow: none; }
-button.ghost { background: transparent; color: #555; border: 1px solid #ddd8ce; }
-button.ghost:hover { color: #111; border-color: #bfb7a9; background: #fff; }
-button.danger { background: #b91c1c; }
-button.danger:hover { background: #991b1b; }
-.primary.wide-btn { width: 100%; height: 42px; font-size: 16px; }
-.inline-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
-.inline-form input, .inline-form select { width: auto; min-width: 130px; }
-.table-wrap { overflow: auto; border: 1px solid #e5e1d8; border-radius: 8px; transition: border-color .18s ease, box-shadow .18s ease; }
-.table-wrap:hover { border-color: #d2cabd; box-shadow: 0 10px 24px rgba(17,17,17,.06); }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { padding: 10px 12px; border-bottom: 1px solid #eeeae2; text-align: left; vertical-align: top; }
-th { color: #666; background: #fbfaf7; font-weight: 700; white-space: nowrap; }
-tbody tr { transition: background-color .16s ease; }
-tbody tr:hover { background: #fbfaf7; }
-code { font-family: Consolas, monospace; font-size: 12px; }
-.chip { display: inline-block; border: 1px solid #d8d3c8; border-radius: 999px; padding: 2px 8px; background: #fbfaf7; transition: border-color .16s ease, background-color .16s ease; }
-.empty { color: #888; text-align: center; padding: 24px; }
-.long-text { min-width: 260px; white-space: pre-wrap; line-height: 1.5; }
-.actions { display: flex; gap: 8px; }
-.expiry-form { min-width: 250px; display: grid; gap: 7px; }
-.expiry-row { display: grid; grid-template-columns: minmax(168px, 1fr) auto; gap: 8px; align-items: center; }
-.expiry-row input { height: 34px; padding: 7px 10px; border-radius: 7px; font-weight: 700; }
-.expiry-row button { height: 34px; min-width: 54px; padding: 0 12px; }
-.expiry-current { color: #64748b; font-size: 12px; line-height: 1.45; }
-.usage-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-.usage-card { border: 1px solid #e5e1d8; border-radius: 8px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); padding: 14px; transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
-.usage-card:hover { transform: translateY(-2px); border-color: #bfdbfe; box-shadow: 0 12px 26px rgba(37, 99, 235, .11); }
-.usage-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-.usage-card-head strong { font-size: 18px; }
-.usage-card-head span { color: #64748b; font-size: 12px; font-weight: 700; }
-.chart-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 12px; }
-.chart-tab { height: 32px; border: 1px solid #dbeafe; border-radius: 8px; background: #eff6ff; color: #1e40af; padding: 0 8px; font-size: 12px; box-shadow: none; }
-.chart-tab:hover, .chart-tab.is-active { background: #2563eb; border-color: #2563eb; color: #fff; box-shadow: 0 8px 16px rgba(37,99,235,.16); }
-.usage-chart { min-height: 200px; position: relative; }
-.chart-pane { display: none; min-height: 190px; animation: chartFade .2s ease-out both; }
-.chart-pane.is-active { display: block; }
-.chart-stage { position: relative; min-height: 190px; }
-.line-svg, .radar-svg { width: 100%; height: 190px; display: block; overflow: visible; }
-.line-svg text, .radar-svg text { fill: #64748b; font-size: 11px; font-weight: 700; }
-.chart-axis, .radar-axis { stroke: #dbeafe; stroke-width: 1.4; }
-.chart-line { fill: none; stroke: #2563eb; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 8px 10px rgba(37,99,235,.18)); }
-.chart-point { position: absolute; left: var(--point-x); top: var(--point-y); width: 24px; height: 24px; border-radius: 999px; background: #fff; color: #1d4ed8; border: 2px solid #2563eb; padding: 0; transform: translate(-50%, -50%); box-shadow: 0 8px 18px rgba(37,99,235,.2); font-size: 10px; line-height: 20px; overflow: visible; }
-.chart-point span { pointer-events: none; }
-.chart-point:hover, .chart-point:focus, .chart-point.is-active { transform: translate(-50%, -50%) scale(1.08); box-shadow: 0 10px 22px rgba(37,99,235,.24); }
-.chart-point::after, .chart-hotspot::after { content: attr(data-tooltip); position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translate(-50%, 6px); opacity: 0; pointer-events: none; white-space: nowrap; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; color: #1e3a8a; padding: 6px 8px; font-size: 12px; font-weight: 800; box-shadow: 0 10px 24px rgba(37,99,235,.16); transition: opacity .16s ease, transform .16s ease; z-index: 4; }
-.chart-point:hover::after, .chart-point:focus::after, .chart-point.is-active::after, .chart-hotspot:hover::after, .chart-hotspot:focus::after, .chart-hotspot.is-active::after { opacity: 1; transform: translate(-50%, 0); }
-.pie-layout { min-height: 190px; display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 14px; align-items: center; }
-.pie-visual { width: 132px; height: 132px; border-radius: 50%; box-shadow: inset 0 0 0 14px rgba(255,255,255,.72), 0 12px 24px rgba(37,99,235,.12); }
-.pie-legend { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
-.pie-legend-item { position: relative; height: 30px; display: flex; align-items: center; justify-content: flex-start; gap: 6px; border: 1px solid #dbeafe; border-radius: 8px; background: #fff; color: #1f2937; padding: 0 8px; box-shadow: none; font-size: 12px; }
-.pie-legend-item span { width: 9px; height: 9px; border-radius: 99px; flex: 0 0 auto; }
-.pie-legend-item:hover, .pie-legend-item.is-active { transform: translateY(-1px); border-color: #93c5fd; background: #eff6ff; box-shadow: none; }
-.radar-ring { fill: none; stroke: #dbeafe; stroke-width: 1.2; }
-.radar-area { fill: rgba(37,99,235,.18); stroke: #2563eb; stroke-width: 3; filter: drop-shadow(0 8px 12px rgba(37,99,235,.14)); }
-.bar-chart { min-height: 190px; display: grid; grid-template-columns: repeat(6, minmax(34px, 1fr)); gap: 9px; align-items: end; padding: 10px 4px 0; }
-.usage-bar { position: relative; height: 158px; width: 100%; display: grid; grid-template-rows: 1fr auto auto; align-items: end; justify-items: center; border: 0; border-radius: 8px; background: transparent; color: #1f2937; padding: 0; box-shadow: none; overflow: visible; }
-.usage-bar:hover, .usage-bar:focus, .usage-bar.is-active { transform: translateY(-2px); box-shadow: none; }
-.usage-bar-fill { width: 100%; height: var(--bar-height); min-height: 6px; border-radius: 8px 8px 5px 5px; background: linear-gradient(180deg, #60a5fa 0%, #2563eb 100%); box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 8px 16px rgba(37,99,235,.16); transition: height .24s ease, filter .18s ease, transform .18s ease; }
-.usage-bar:hover .usage-bar-fill, .usage-bar:focus .usage-bar-fill, .usage-bar.is-active .usage-bar-fill { filter: saturate(1.08); transform: scaleX(1.04); }
-.usage-value { margin-top: 7px; font-size: 13px; font-weight: 800; }
-.usage-label { margin-top: 3px; color: #64748b; font-size: 12px; }
-.usage-bar::after { bottom: calc(var(--bar-height) + 54px); }
-.settings-list { display: grid; gap: 10px; }
-.settings-list div { display: flex; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid #eeeae2; padding-bottom: 10px; }
-.settings-list span { color: #666; }
-.settings-list strong { text-align: right; overflow-wrap: anywhere; }
-.field-note { color: #64748b; font-size: 12px; line-height: 1.5; margin-top: -4px; }
-.form-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.form-grid-2 > div { display: grid; gap: 8px; }
-.toggle-field { min-height: 58px; display: flex; align-items: center; gap: 12px; border: 1px solid #dbeafe; border-radius: 8px; background: #f8fbff; padding: 10px 12px; cursor: pointer; transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease; }
-.toggle-field:hover { border-color: #93c5fd; background: #eff6ff; box-shadow: 0 8px 18px rgba(37,99,235,.08); }
-.toggle-field input { appearance: none; position: relative; width: 44px; min-width: 44px; height: 24px; border: 0; border-radius: 999px; background: #cbd5e1; padding: 0; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(15,23,42,.08); transition: background-color .2s ease; }
-.toggle-field input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 2px 5px rgba(15,23,42,.2); transition: transform .2s ease; }
-.toggle-field input:checked { background: #2563eb; }
-.toggle-field input:checked::after { transform: translateX(20px); }
-.toggle-field input:focus-visible { outline: 3px solid rgba(37,99,235,.22); outline-offset: 2px; }
-.toggle-field span { display: grid; gap: 3px; }
-.toggle-field strong { color: #1f2937; font-size: 14px; }
-.toggle-field small { color: #64748b; font-size: 12px; line-height: 1.4; }
-.image-ai-preview { display: grid; gap: 10px; border-top: 1px solid #e5e7eb; margin-top: 20px; padding-top: 18px; }
-.image-ai-preview span { color: #475569; font-size: 13px; font-weight: 700; }
-.image-ai-preview img { display: block; width: min(100%, 420px); aspect-ratio: 1; object-fit: contain; border: 1px solid #dbeafe; border-radius: 8px; background: #f8fafc; }
-.ai-actions { justify-content: flex-end; margin-top: 8px; }
-.ai-actions button { min-width: 118px; height: 44px; }
-.notice { border-radius: 8px; padding: 11px 13px; margin-bottom: 12px; font-weight: 700; line-height: 1.5; }
-.notice.success { border: 1px solid #bbf7d0; background: #f0fdf4; color: #166534; }
-.notice.error { border: 1px solid #fecaca; background: #fef2f2; color: #991b1b; }
-.ai-guide { background: linear-gradient(135deg, #fff 0%, #eff6ff 100%); }
-.login-body { min-height: 100vh; display: grid; place-items: center; }
-.login-panel { width: min(380px, calc(100vw - 32px)); border: 1px solid #ddd8ce; border-radius: 8px; background: #fff; padding: 28px; animation: consoleEnter .32s ease-out both; }
-.brand-line { color: #777; font-size: 12px; font-weight: 800; margin-bottom: 14px; }
-.login-panel form { display: grid; gap: 10px; margin-top: 18px; }
-.error { color: #b91c1c; margin-top: 12px; }
-@keyframes consoleEnter {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-@keyframes chartFade {
-  from { opacity: 0; transform: translateY(5px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
-}
-@media (max-width: 980px) {
-  .sidebar { position: static; width: auto; border-right: 0; border-bottom: 1px solid #dedbd2; }
-  .console { margin-left: 0; padding: 20px; }
-  .page-head, .split, .grid, .metrics { grid-template-columns: 1fr; }
-  .usage-grid { grid-template-columns: 1fr; }
-  .form-grid-2 { grid-template-columns: 1fr; }
-  .span-2 { grid-column: auto; }
-}
-"""
-
-
-_DASHBOARD_JS = """
-document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('.ai-form').forEach((form) => {
-    form.addEventListener('submit', (event) => {
-      const submitter = event.submitter;
-      if (!submitter) return;
-      form.querySelectorAll('button[type="submit"]').forEach((button) => {
-        button.disabled = true;
-      });
-      submitter.textContent = submitter.formAction.endsWith('/save') ? '正在保存并重启…' : '正在检测…';
-    });
-  });
-
-  const activateHotspot = (target, selector) => {
-    document.querySelectorAll(selector + '.is-active').forEach((item) => {
-      if (item !== target) item.classList.remove('is-active');
-    });
-    target.classList.toggle('is-active');
-  };
-
-  document.querySelectorAll('.chart-tab').forEach((tab) => {
-    const switchChart = () => {
-      const card = tab.closest('.usage-card');
-      if (!card) return;
-      const type = tab.dataset.chartType;
-      card.querySelectorAll('.chart-tab').forEach((item) => {
-        item.classList.toggle('is-active', item === tab);
-      });
-      card.querySelectorAll('.chart-pane').forEach((pane) => {
-        pane.classList.toggle('is-active', pane.dataset.chartType === type);
-      });
-    };
-    tab.addEventListener('click', switchChart);
-  });
-
-  document.querySelectorAll('.usage-bar, .chart-point, .chart-hotspot').forEach((bar) => {
-    const activate = () => {
-      activateHotspot(bar, '.usage-bar, .chart-point, .chart-hotspot');
-    };
-    bar.addEventListener('touchstart', (event) => {
-      event.preventDefault();
-      activate();
-    }, { passive: false });
-    bar.addEventListener('click', activate);
-  });
-});
-"""
 
 
 app = create_app(
