@@ -336,46 +336,6 @@ class ControlService:
                        for key in RESOURCE_STATS_WINDOWS},
         } for resource in sorted(RESOURCE_NAMES)]
 
-    def recent_resource_usage(self, limit: int = 6) -> list[dict]:
-        with session_scope(self.engine) as session:
-            rows = session.scalars(select(ResourceUsage).where(ResourceUsage.used_at <= utc_now()).order_by(
-                ResourceUsage.used_at.desc(), ResourceUsage.id.desc(),
-            ).limit(min(50, max(1, int(limit))))).all()
-            return [{"resource": row.resource, "user_key": row.user_key,
-                     "used_at": format_beijing_datetime(row.used_at)} for row in rows]
-
-    def resource_usage_trend(self, interval: str = "hour", now: datetime | None = None) -> dict:
-        """Non-overlapping, Beijing-aligned buckets; never infer trends from rolling totals."""
-        now = self._aware_utc(now or utc_now())
-        interval = interval if interval in {"minute", "hour", "day"} else "hour"
-        seconds, length = {"minute": (60, 60), "hour": (3600, 24), "day": (86400, 7)}[interval]
-        local = now.astimezone(BEIJING_TZ).replace(second=0, microsecond=0)
-        if interval != "minute":
-            local = local.replace(minute=0)
-        if interval == "day":
-            local = local.replace(hour=0)
-        step = timedelta(seconds=seconds)
-        end = (local + step).astimezone(timezone.utc)
-        start = end - step * length
-        buckets = [start + step * index for index in range(length)]
-        with session_scope(self.engine) as session:
-            rows = session.execute(select(
-                ResourceUsage.resource,
-                *[func.sum(case((and_(ResourceUsage.used_at >= stamp, ResourceUsage.used_at < stamp + step), 1), else_=0)).label(f"b{index}")
-                  for index, stamp in enumerate(buckets)],
-            ).where(ResourceUsage.used_at >= start, ResourceUsage.used_at <= now,
-                    ResourceUsage.used_at < end).group_by(ResourceUsage.resource)).mappings().all()
-        mapped = {row["resource"]: row for row in rows}
-        series = {name: [int(mapped.get(name, {}).get(f"b{index}", 0) or 0) for index in range(length)]
-                  for name in sorted(RESOURCE_NAMES)}
-        return {
-            "interval": interval, "series": series,
-            "labels": [stamp.astimezone(BEIJING_TZ).strftime("%m-%d %H:%M") for stamp in buckets],
-            "start": buckets[0].astimezone(BEIJING_TZ).strftime("%m-%d %H:%M"),
-            "as_of": now.astimezone(BEIJING_TZ).strftime("%m-%d %H:%M"),
-            "total": sum(sum(values) for values in series.values()),
-        }
-
     def list_resource_user_usage(self, *, resource: str = "", query: str = "",
                                  page: int = 1, page_size: int = 20,
                                  now: datetime | None = None) -> dict:
