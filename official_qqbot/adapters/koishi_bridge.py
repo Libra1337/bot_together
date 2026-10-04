@@ -48,19 +48,17 @@ def adapt_koishi_payload(
             limit_user_id=limit_user_id or user_openid,
         )
 
-    if not is_at and group_openid not in full_message_group_ids:
+    if not is_at and full_message_group_ids and group_openid not in full_message_group_ids:
         return None
 
-    is_full_message = event_type == GROUP_MESSAGE_CREATE or (
-        not is_at and group_openid in full_message_group_ids
-    )
+    is_full_message = event_type == GROUP_MESSAGE_CREATE or not is_at
 
     return MessageEvent(
         type="group",
         group_openid=group_openid,
         user_openid=user_openid,
         msg_id=msg_id,
-        content=normalize_group_content(raw_content),
+        content=normalize_group_content(raw_content) if is_at else raw_content,
         raw_content=raw_content,
         event_type=event_type,
         is_at=is_at,

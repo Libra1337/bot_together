@@ -12,7 +12,7 @@ if (!appId || !appSecret) {
   throw new Error('QQ_APP_ID and QQ_APP_SECRET are required')
 }
 
-const whitelist = (process.env.QQ_GROUP_WHITELIST || '1097445697')
+const whitelist = (process.env.QQ_GROUP_WHITELIST || '')
   .split(',')
   .map((item) => item.trim())
   .filter(Boolean)

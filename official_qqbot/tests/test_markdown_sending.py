@@ -65,6 +65,24 @@ class MarkdownSendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["msg_id"], "msg-a")
         self.assertNotIn("content", payload)
 
+    async def test_leading_blank_lines_are_removed_for_group_private_and_fallback(self):
+        for send, target in ((bot.send_group_msg, "group-a"), (bot.send_c2c_msg, "user-a")):
+            for fallback in (False, True):
+                with self.subTest(send=send.__name__, fallback=fallback):
+                    _CaptureClient.calls = []
+                    _CaptureClient.responses = [_Response(400), _Response(200)] if fallback else [_Response(200)]
+                    with patch.object(bot.httpx, "AsyncClient", _CaptureClient):
+                        ok = await send(target, "\ufeff\r\n \t\u200b\r\n## 标题\r\n\r\n正文  \r\n下一行", "blank-msg")
+                    self.assertTrue(ok)
+                    expected = "## 标题\n\n正文  \n下一行"
+                    self.assertEqual(_CaptureClient.calls[0]["json"]["markdown"]["content"], expected)
+                    if fallback:
+                        self.assertEqual(_CaptureClient.calls[1]["json"]["content"], expected)
+
+    def test_markdown_normalization_preserves_code_indentation_and_inner_blank_lines(self):
+        payload = bot._build_markdown_payload("\n    code\n\n    more code\n", "msg", 1)
+        self.assertEqual(payload["markdown"]["content"], "    code\n\n    more code\n")
+
     async def test_private_message_uses_markdown_payload_by_default(self):
         _CaptureClient.responses = [_Response(200, "ok")]
 

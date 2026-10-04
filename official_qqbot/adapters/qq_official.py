@@ -40,6 +40,8 @@ class MessageEvent:
         }
         if self.image_urls:
             ctx["image_urls"] = self.image_urls
+        if self.is_full_message and not self.is_at:
+            ctx["commands_only"] = True
         return ctx
 
 
@@ -80,12 +82,14 @@ def adapt_message_event(
         is_at = event_type in GROUP_AT_MESSAGE_EVENTS
         is_full_message = event_type in GROUP_FULL_MESSAGE_EVENTS
 
-        if is_full_message and group_openid not in full_message_group_ids:
+        if is_full_message and full_message_group_ids and group_openid not in full_message_group_ids:
             return None
 
         raw_content = data.get("content", "").strip()
         author = data.get("author", {})
-        member_openid = author.get("member_openid", "")
+        if author.get("bot"):
+            return None
+        member_openid = author.get("member_openid") or author.get("id", "")
         limit_user_id = (
             author.get("user_openid")
             or author.get("union_openid")
@@ -97,7 +101,7 @@ def adapt_message_event(
             group_openid=group_openid,
             user_openid=member_openid,
             msg_id=data.get("id", ""),
-            content=normalize_group_content(raw_content),
+            content=normalize_group_content(raw_content) if is_at else raw_content,
             raw_content=raw_content,
             event_type=event_type,
             is_at=is_at,

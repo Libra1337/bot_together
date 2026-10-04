@@ -244,7 +244,15 @@ NONEBOT_DRIVER=~httpx+~websockets
 NONEBOT_QQ_USE_WEBSOCKET=1
 ```
 
-Keep `QQ_GROUP_WHITELIST` aligned with the `group_openid` reported in logs. Group @ and C2C events do not require the whitelist; non-@ group messages do.
+Leave `QQ_GROUP_WHITELIST` and the YAML `bot.full_message_group_ids` / `bot.non_at_group_whitelist` lists empty to accept commands from all groups. To restrict non-@ commands, fill these with actual `group_openid` values reported by QQ, not numeric QQ group numbers. Nonempty lists are combined; group @ and C2C events bypass this restriction.
+
+## Group commands without mentions
+
+Enable **接收所有消息** in QQ's robot/group settings. According to the [official full-message event documentation](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html), QQ then delivers `GROUP_MESSAGE_CREATE` using the existing `GROUP_AND_C2C_EVENT` intent (`1 << 25`, decimal `33554432`). Code and intent changes alone cannot enable this platform setting.
+
+Users can send `/help`, `/4399`, `签到`, `点歌 歌名`, `/bind 邮箱`, or `/生图 描述` directly. Full-message events only process commands and active follow-ups from the same conversation; normal chatter, unaddressed images and links do not invoke AI. Mention the robot for AI chat or natural-language image requests. Duplicate full/@ deliveries are processed once.
+
+The Python webhook verifies `X-Bot-Appid`, `X-Signature-Timestamp`, and `X-Signature-Ed25519` before dispatching commands. Proxies must preserve these headers and the original request body. Markdown and its text fallback remove leading empty lines/BOM while preserving internal paragraphs, hard breaks, and code indentation.
 
 To roll back to Koishi:
 

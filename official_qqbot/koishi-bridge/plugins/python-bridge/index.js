@@ -72,6 +72,7 @@ exports.apply = (ctx, config) => {
     if (session.userId && session.selfId && session.userId === session.selfId) return next()
 
     const eventType = session.qq?.t || ''
+    if (session.qq?.d?.author?.bot) return next()
     const rawContent = String(session.content || '')
     const content = stripLeadingMention(rawContent)
     const groupId = firstNonEmpty(
@@ -174,6 +175,7 @@ function privateSeed(secret) {
 function adaptOfficialWebhookPayload(payload, whitelist) {
   const eventType = String(payload.t || '')
   const data = payload.d || {}
+  if (data.author?.bot) return null
   const rawContent = String(data.content || '').trim()
 
   if (eventType === 'C2C_MESSAGE_CREATE') {

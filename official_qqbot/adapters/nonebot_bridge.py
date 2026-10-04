@@ -80,9 +80,11 @@ def event_to_bridge_payload(
         }
 
     if event_type in {GROUP_AT_MESSAGE_CREATE, GROUP_MESSAGE_CREATE}:
+        if getattr(getattr(event, "author", None), "bot", False):
+            return None
         group_openid = _first_non_empty(getattr(event, "group_openid", ""))
         is_at = event_type == GROUP_AT_MESSAGE_CREATE
-        if not is_at and group_openid not in full_message_group_ids:
+        if not is_at and full_message_group_ids and group_openid not in full_message_group_ids:
             return None
 
         content = _event_plain_text(event)
@@ -95,7 +97,7 @@ def event_to_bridge_payload(
             "group_openid": group_openid,
             "user_openid": _author_openid(event, "member_openid", "id"),
             "msg_id": msg_id,
-            "content": normalize_group_content(content),
+            "content": normalize_group_content(content) if is_at else content,
             "raw_content": content,
             "is_at": is_at,
             "event_type": event_type,

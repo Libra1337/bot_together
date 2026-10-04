@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 class QQWebhookBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_webhook_validation_returns_plain_token_and_signature(self):
         result = await bot.handle_qq_webhook_payload(
-            {"d": {"event_ts": "1710000000", "plain_token": "plain-token"}},
+            {"op": 13, "d": {"event_ts": "1710000000", "plain_token": "plain-token"}},
             app_secret="test-secret-value",
         )
 

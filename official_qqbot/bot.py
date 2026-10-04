@@ -16,6 +16,7 @@ import time as _time_mod
 import yaml
 import httpx
 import websockets
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from difflib import SequenceMatcher
 from collections import OrderedDict
@@ -43,8 +44,8 @@ from handlers import fun, bilibili, douyin, music, github
 from handlers import email_sender
 
 # ====== 版本 ======
-BOT_VERSION = "1.1.0"
-BOT_BUILD_DATE = "2026-04-13"
+BOT_VERSION = "1.2.0"
+BOT_BUILD_DATE = "2026-10-05"
 _start_time: float = _time_mod.time()
 
 # ====== 日志 ======
@@ -1016,13 +1017,20 @@ def _build_markdown_payload(
 ) -> dict:
     payload = {
         "msg_type": 2,
-        "markdown": {"content": content},
+        "markdown": {"content": _normalize_message_start(content)},
         "msg_id": msg_id,
         "msg_seq": msg_seq,
     }
     if keyboard:
         payload["keyboard"] = keyboard
     return payload
+
+
+def _normalize_message_start(content: str) -> str:
+    """Remove empty leading lines/BOM without damaging Markdown indentation."""
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    content = re.sub(r"\A(?:(?:[^\S\n]|[\u200b\ufeff])*\n)+", "", content)
+    return content.lstrip("\u200b\ufeff")
 
 
 def _build_send_payload(
@@ -1098,6 +1106,7 @@ async def _post_with_markdown_fallback(
     log_prefix: str,
     keyboard: dict | None = None,
 ) -> bool:
+    content = _normalize_message_start(content)
     body = _build_send_payload(
         content, msg_id, _next_msg_seq(key), markdown=True, keyboard=keyboard
     )
@@ -1415,7 +1424,7 @@ async def handle_command(ctx, content):
                 "/ads- 编号 — 移除展示\n"
                 "━━━━━━━━━━━━━━\n"
                 f"v{BOT_VERSION} | 构建：{BOT_BUILD_DATE}\n"
-                "群聊 @我 或私聊直接发消息即可喵~"
+                "群聊可直接发送指令；AI 聊天请 @我。私聊直接发消息即可喵~"
             ),
         )
         return True
@@ -2171,9 +2180,53 @@ async def handle_image_request(ctx, content):
 
 
 # ====== 消息入口 ======
+def _pending_for_context(states, ctx):
+    pending = states.get(ctx["user_openid"])
+    if not pending:
+        return None
+    origin = pending.get("ctx", {})
+    if (origin.get("type"), origin.get("group_openid", "")) != (
+        ctx.get("type"), ctx.get("group_openid", "")
+    ):
+        return None
+    return pending
+
+
+def _is_group_command(ctx, content):
+    """Only explicit commands and same-conversation follow-ups trigger full events."""
+    content = content.strip()
+    if not content:
+        return False
+    lower = content.lower()
+    if lower.startswith("/") or lower in _KNOWN_COMMANDS or lower in {
+        "mdtest", "auth", "quit", "admin", "whois", "unbind", "绑邮箱", "取消邮箱", "查库存",
+    }:
+        return True
+    if re.match(
+        r"^(?:auth|点歌|听歌|来首歌|搜索github|github搜|搜索gh|绑定邮箱|绑定qq号)\s+",
+        content, re.IGNORECASE,
+    ) or re.fullmatch(r".{1,10}天气", content):
+        return True
+    if re.match(r"^(?:生图|绘图)(?:\s|$)", content):
+        return True
+    now = _time_mod.time()
+    for states in (_music_select, _github_select):
+        pending = _pending_for_context(states, ctx)
+        if pending and now - pending.get("ts", 0) < 120 and content.isdigit():
+            return True
+    pending = _pending_for_context(_music_waiting, ctx)
+    if pending and now - pending.get("ts", 0) < 60:
+        return True
+    pending = _pending_for_context(_fuzzy_waiting, ctx)
+    return bool(pending and now < pending.get("expire", 0) and lower in {"y", "n", "no", "取消", "算了"})
+
+
 async def process_message(ctx, content):
     """统一消息处理入口"""
     image_urls = tuple(ctx.get("image_urls") or ())
+    commands_only = bool(ctx.get("commands_only"))
+    if commands_only and not _is_group_command(ctx, content):
+        return
     if not content and not image_urls:
         await reply(ctx, "喵？你叫我了吗~")
         return
@@ -2183,7 +2236,7 @@ async def process_message(ctx, content):
     now = _time_mod.time()
 
     # 0a. 点歌选择状态
-    sel = _music_select.get(user_id)
+    sel = _pending_for_context(_music_select, ctx)
     if sel and now - sel.get("ts", 0) < 120 and content.isdigit():
         idx = int(content)
         songs = sel.get("songs", [])
@@ -2199,7 +2252,7 @@ async def process_message(ctx, content):
             return
 
     # 0b. GitHub 选择状态
-    gsel = _github_select.get(user_id)
+    gsel = _pending_for_context(_github_select, ctx)
     if gsel and now - gsel.get("ts", 0) < 120 and content.isdigit():
         idx = int(content)
         repos = gsel.get("repos", [])
@@ -2215,7 +2268,7 @@ async def process_message(ctx, content):
             return
 
     # 0c. 点歌等待输入歌名
-    mw = _music_waiting.get(user_id)
+    mw = _pending_for_context(_music_waiting, ctx)
     if mw and now - mw.get("ts", 0) < 60:
         del _music_waiting[user_id]
         songs = await music.search_music(content)
@@ -2232,7 +2285,7 @@ async def process_message(ctx, content):
         del _music_waiting[user_id]
 
     # 0d. 模糊指令确认
-    fw = _fuzzy_waiting.get(user_id)
+    fw = _pending_for_context(_fuzzy_waiting, ctx)
     if fw and now < fw.get("expire", 0):
         lowered = content.strip().lower()
         if lowered == "y":
@@ -2260,7 +2313,7 @@ async def process_message(ctx, content):
         return
 
     # 3. 链接解析
-    if await check_links(ctx, content):
+    if not commands_only and await check_links(ctx, content):
         return
 
     # 4. AI 生图
@@ -2280,6 +2333,8 @@ async def process_message(ctx, content):
             return
 
     # 6. AI 对话
+    if commands_only:
+        return
     chat_id = f"{ctx['type']}_{user_id}"
     ai_reply = await ai_chat.chat(chat_id, content, image_urls=image_urls)
     if len(ai_reply) > 2000:
@@ -2294,6 +2349,9 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         _log.debug(
             f"[群消息忽略] event={event_type} group={data.get('group_openid', '')}"
         )
+        return
+
+    if event.is_full_message and not event.is_at and not _is_group_command(event.to_ctx(), event.content):
         return
 
     if not _remember_group_message(event.group_openid, event.msg_id):
@@ -2332,6 +2390,9 @@ async def handle_koishi_bridge_payload(payload: dict):
     if not event:
         return {"ok": True, "ignored": True}
 
+    if event.is_full_message and not event.is_at and not _is_group_command(event.to_ctx(), event.content):
+        return {"ok": True, "ignored": True}
+
     if event.type == "group" and not _remember_group_message(
         event.group_openid, event.msg_id
     ):
@@ -2355,14 +2416,58 @@ async def handle_koishi_bridge_payload(payload: dict):
     return {"ok": True, "ignored": False}
 
 
-def _build_qq_webhook_signature(app_secret: str, event_ts: str, plain_token: str) -> str:
+def _qq_webhook_key(app_secret: str):
     secret_bytes = str(app_secret or "").encode("utf-8")
     if not secret_bytes:
         raise ValueError("QQ_APP_SECRET is required for webhook validation")
     while len(secret_bytes) < 32:
         secret_bytes = (secret_bytes + secret_bytes)[:32]
-    key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes[:32])
+    return ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes[:32])
+
+
+def _build_qq_webhook_signature(app_secret: str, event_ts: str, plain_token: str) -> str:
+    key = _qq_webhook_key(app_secret)
     return key.sign(f"{event_ts}{plain_token}".encode("utf-8")).hex()
+
+
+def _verify_qq_webhook(body: bytes, headers) -> bool:
+    if APP_ID and headers.get("X-Bot-Appid", "") != str(APP_ID):
+        return False
+    timestamp = headers.get("X-Signature-Timestamp", "")
+    signature = headers.get("X-Signature-Ed25519", "")
+    if not timestamp or not signature:
+        return False
+    try:
+        _qq_webhook_key(APP_SECRET).public_key().verify(
+            bytes.fromhex(signature), timestamp.encode("utf-8") + body
+        )
+    except (ValueError, InvalidSignature):
+        return False
+    return True
+
+
+async def _receive_qq_webhook(request):
+    from aiohttp import web
+
+    body = await request.read()
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+    # QQ URL verification (op 13) uses the challenge/response handshake.
+    # Dispatches must authenticate the exact bytes forwarded by the proxy.
+    if APP_ID and request.headers.get("X-Bot-Appid", "") != str(APP_ID):
+        return web.json_response({"error": "invalid_appid"}, status=403)
+    if payload.get("op") != 13 and not _verify_qq_webhook(body, request.headers):
+        return web.json_response({"error": "invalid_signature"}, status=403)
+    try:
+        result = await handle_qq_webhook_payload(payload)
+    except Exception as error:
+        _log.error(f"[QQWebhook] 处理失败: {error}")
+        return web.json_response({"status": "error", "error": "handler_failed"}, status=500)
+    return web.json_response(result)
 
 
 async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None):
@@ -2370,7 +2475,7 @@ async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None
         return {"status": "ignored", "reason": "invalid_payload"}
 
     data = payload.get("d", {})
-    if isinstance(data, dict) and "event_ts" in data and "plain_token" in data:
+    if payload.get("op") == 13 and isinstance(data, dict) and "event_ts" in data and "plain_token" in data:
         plain_token = str(data.get("plain_token", ""))
         event_ts = str(data.get("event_ts", ""))
         return {
@@ -2382,6 +2487,8 @@ async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None
             ),
         }
 
+    if payload.get("op") != 0:
+        return {"status": "ignored", "reason": "unsupported_opcode"}
     event_type = str(payload.get("t") or payload.get("event_type") or "")
     if not isinstance(data, dict):
         data = {}
@@ -2427,23 +2534,10 @@ async def run_koishi_bridge_server():
         result = await handle_koishi_bridge_payload(payload)
         return web.json_response(result)
 
-    async def receive_qq_webhook(request):
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
-
-        try:
-            result = await handle_qq_webhook_payload(payload)
-        except Exception as e:
-            _log.error(f"[QQWebhook] 处理失败: {e}")
-            return web.json_response({"status": "error", "error": "handler_failed"}, status=500)
-        return web.json_response(result)
-
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_post("/koishi/message", receive_message)
-    app.router.add_post(QQ_WEBHOOK_PATH, receive_qq_webhook)
+    app.router.add_post(QQ_WEBHOOK_PATH, _receive_qq_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2646,6 +2740,7 @@ async def main():
         f"模型: {IMAGE_AI_MODEL or '未配置'}"
     )
     _log.info(f"Gateway intents: {GATEWAY_INTENTS}")
+    _log.info(f"Full group messages: commands only; groups={sorted(FULL_MESSAGE_GROUP_IDS) or 'all'}")
     _log.info(f"Official WS enabled: {OFFICIAL_WS_ENABLED}")
     _log.info(f"Bridge listener enabled: {BRIDGE_ENABLED}")
     _log.info("=" * 50)

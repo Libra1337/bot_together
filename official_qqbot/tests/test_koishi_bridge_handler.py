@@ -15,7 +15,7 @@ class KoishiBridgeHandlerTests(unittest.IsolatedAsyncioTestCase):
             "group_openid": "1097445697",
             "user_openid": "user-openid",
             "msg_id": "bridge-msg-1",
-            "content": "你好",
+            "content": "/help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
@@ -29,8 +29,9 @@ class KoishiBridgeHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "user_openid": "user-openid",
                 "limit_user_id": "user-openid",
                 "msg_id": "bridge-msg-1",
+                "commands_only": True,
             },
-            "你好",
+            "/help",
         )
 
     async def test_bridge_payload_ignores_duplicate_message_id(self):
@@ -39,7 +40,7 @@ class KoishiBridgeHandlerTests(unittest.IsolatedAsyncioTestCase):
             "group_openid": "1097445697",
             "user_openid": "user-openid",
             "msg_id": "bridge-msg-duplicate",
-            "content": "你好",
+            "content": "/help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:

@@ -8,13 +8,16 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot._recent_group_msg_ids.clear()
         bot._recent_c2c_msg_ids.clear()
+        whitelist = patch.object(bot, "FULL_MESSAGE_GROUP_IDS", {"1097445697"})
+        whitelist.start()
+        self.addCleanup(whitelist.stop)
 
     async def test_non_at_group_message_is_processed_for_whitelisted_group(self):
         data = {
             "group_openid": "1097445697",
             "id": "msg-whitelist",
             "author": {"member_openid": "user-openid"},
-            "content": "hello",
+            "content": "/help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
@@ -27,8 +30,9 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
                 "user_openid": "user-openid",
                 "limit_user_id": "user-openid",
                 "msg_id": "msg-whitelist",
+                "commands_only": True,
             },
-            "hello",
+            "/help",
         )
 
     async def test_non_at_group_message_is_ignored_for_non_whitelisted_group(self):
@@ -36,7 +40,7 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
             "group_openid": "other-group",
             "id": "msg-other",
             "author": {"member_openid": "user-openid"},
-            "content": "hello",
+            "content": "/help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
@@ -49,7 +53,7 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
             "group_openid": "other-group",
             "id": "msg-at",
             "author": {"member_openid": "user-openid"},
-            "content": "@bot hello",
+            "content": "@bot /help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
@@ -63,7 +67,7 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
                 "limit_user_id": "user-openid",
                 "msg_id": "msg-at",
             },
-            "hello",
+            "/help",
         )
 
     async def test_official_mention_markup_is_stripped_before_processing(self):
@@ -93,7 +97,7 @@ class GroupMessageRoutingTests(unittest.IsolatedAsyncioTestCase):
             "group_openid": "1097445697",
             "id": "msg-duplicate",
             "author": {"member_openid": "user-openid"},
-            "content": "hello",
+            "content": "/help",
         }
 
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:

@@ -1,0 +1,20 @@
+bot:
+  app_id: ""
+  app_secret: ""
+  sandbox: false
+  official_ws_enabled: true
+  markdown_enabled: true
+  # Empty means all groups; values must be group_openid, not numeric QQ group IDs.
+  full_message_group_ids: []
+bridge:
+  enabled: false
+  host: 127.0.0.1
+  port: 8765
+ai:
+  base_url: https://example.com/v1
+  api_key: ""
+  model: deepseek-v4-flash
+image_ai:
+  enabled: false
+email: {}
+control_api: {}

@@ -87,12 +87,18 @@ def _register_group_message_event() -> None:
         log.warning("failed to register GROUP_MESSAGE_CREATE event: %s", error)
         return
 
-    if "GROUP_MESSAGE_CREATE" in EVENT_CLASSES:
-        return
+    # New adapter releases require group_id even though QQ documents only
+    # group_openid. Keep their behavior but accept the documented payload.
+    base_event = EVENT_CLASSES.get("GROUP_MESSAGE_CREATE", QQMessageEvent)
 
-    class GroupMessageCreateEvent(QQMessageEvent):
+    class CompatibleGroupAuthor(GroupMemberAuthor):
+        bot: bool = False
+        member_role: str = "member"
+
+    class GroupMessageCreateEvent(base_event):
         __type__: ClassVar[str] = "GROUP_MESSAGE_CREATE"
-        author: GroupMemberAuthor
+        author: CompatibleGroupAuthor
+        group_id: str = ""
         group_openid: str
         to_me: bool = False
 
