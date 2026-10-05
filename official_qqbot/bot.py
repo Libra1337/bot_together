@@ -2461,8 +2461,10 @@ async def _receive_qq_webhook(request):
     # QQ URL verification (op 13) uses the challenge/response handshake.
     # Dispatches must authenticate the exact bytes forwarded by the proxy.
     if APP_ID and request.headers.get("X-Bot-Appid", "") != str(APP_ID):
+        _log.warning("[QQWebhook] rejected: invalid_appid")
         return web.json_response({"error": "invalid_appid"}, status=403)
     if payload.get("op") != 13 and not _verify_qq_webhook(body, request.headers):
+        _log.warning("[QQWebhook] rejected: invalid_signature")
         return web.json_response({"error": "invalid_signature"}, status=403)
     try:
         result = await handle_qq_webhook_payload(payload)
@@ -2496,6 +2498,12 @@ async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None
         data = {}
 
     if event_type in GROUP_MESSAGE_EVENTS:
+        if event_type != GROUP_AT_MESSAGE_CREATE:
+            _log.info(
+                "[QQWebhook] dispatch=%s group_allowed=%s",
+                event_type,
+                not FULL_MESSAGE_GROUP_IDS or data.get("group_openid", "") in FULL_MESSAGE_GROUP_IDS,
+            )
         await handle_group_message(data, event_type)
     elif event_type == C2C_MESSAGE_CREATE:
         await handle_c2c_message(data)

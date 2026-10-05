@@ -1,11 +1,15 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+import httpx
 
 import bot
+from control_api.app import create_app
 
 
 class WebhookAuthenticationTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +40,27 @@ class WebhookAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post("/qq", data=body, headers=self.headers(body))
         self.assertEqual(response.status, 200)
         handler.assert_awaited_once_with({"content": "签到"}, "GROUP_MESSAGE_CREATE")
+
+    async def test_signed_messages_survive_public_proxy_and_invalid_requests_fail(self):
+        # Exercise the public route AND the real HTTP hop to the bot verifier.
+        with tempfile.TemporaryDirectory() as temp:
+            app = create_app(f"sqlite:///{temp}/control.db", "bot", "admin")
+            try:
+                with patch.dict(os.environ, {"QQ_WEBHOOK_FORWARD_URL": str(self.client.make_url('/qq')), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                        for event in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
+                            body = json.dumps({"op": 0, "t": event, "d": {"content": "签到"}}, ensure_ascii=False).encode()
+                            with patch.object(bot, "handle_group_message", new_callable=AsyncMock) as handler:
+                                response = await client.post('/qq', content=body, headers=self.headers(body))
+                                self.assertEqual(response.status_code, 200)
+                                handler.assert_awaited_once_with({"content": "签到"}, event)
+                            for headers, sent_body in ((self.headers(body), body + b' '), ({"X-Bot-Appid": "app"}, body)):
+                                with patch.object(bot, "handle_group_message", new_callable=AsyncMock) as handler:
+                                    response = await client.post('/qq', content=sent_body, headers=headers)
+                                    self.assertEqual(response.status_code, 403)
+                                    handler.assert_not_awaited()
+            finally:
+                app.state.engine.dispose()
 
     async def test_unsigned_tampered_wrong_app_and_malformed_signatures_are_rejected(self):
         body = b'{"op":0,"t":"GROUP_MESSAGE_CREATE","d":{}}'

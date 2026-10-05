@@ -664,10 +664,13 @@ async def _forward_qq_webhook(
     headers: dict,
     forward_url: str,
 ) -> tuple[int, bytes, str]:
+    headers = {key.lower(): value for key, value in headers.items()}
     request_headers = {
         "content-type": headers.get("content-type", "application/json"),
         "user-agent": headers.get("user-agent", ""),
         "x-bot-appid": headers.get("x-bot-appid", ""),
+        "x-signature-timestamp": headers.get("x-signature-timestamp", ""),
+        "x-signature-ed25519": headers.get("x-signature-ed25519", ""),
     }
     request_headers = {key: value for key, value in request_headers.items() if value}
     try:
