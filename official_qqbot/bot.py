@@ -1392,6 +1392,7 @@ def _default_resource_keyboard() -> dict:
                 _command_button("quick_163", "获取163", "/163", 1),
             ],
             [
+                _command_button("quick_sign", "每日签到", "签到", 1),
                 _command_button("quick_stock", "查询库存", "/查库存", 1),
                 _command_button("quick_bind", "快捷绑定", "/bind", 1),
             ]
