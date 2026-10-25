@@ -129,17 +129,26 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             "type": "c2c",
             "user_openid": self.user_id,
             "msg_id": "msg-restrict",
+            "limit_user_id": self.user_id,
         }
         self.old_admins = set(bot._admin_set)
         self.old_state_backend = bot._state_backend
         bot._admin_set.add(self.user_id)
         if hasattr(bot, "_active_resource_request_keys"):
             bot._active_resource_request_keys.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_sign_file = bot.SIGN_FILE
+        bot.SIGN_FILE = os.path.join(self.tmp.name, "sign_official.json")
+        self.old_sign = bot._sign_data
+        bot._sign_data = {self.user_id: {"points": 500, "streak": 1, "last": ""}}
 
     def tearDown(self):
         bot._admin_set.clear()
         bot._admin_set.update(self.old_admins)
         bot._state_backend = self.old_state_backend
+        bot._sign_data = self.old_sign
+        bot.SIGN_FILE = self.old_sign_file
+        self.tmp.cleanup()
 
     async def test_restrict_command_sets_rule_for_admin(self):
         with patch.object(bot._shared_cd, "set_restrict_rule") as set_rule, patch.object(
@@ -165,14 +174,15 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
-            bot, "_check_resource_restrict", new_callable=AsyncMock
-        ) as check_restrict, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
         ) as get_credentials, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             require_email.return_value = False
-            check_restrict.return_value = True
             get_credentials.return_value = (True, "account: demo\npassword: secret")
             send_result.return_value = True
 
@@ -182,18 +192,23 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         require_email.assert_not_awaited()
         get_credentials.assert_awaited_once()
         send_result.assert_awaited_once()
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 498)
+        self.assertIn("剩余积分：498", send_result.await_args.kwargs["quota_text"])
 
     async def test_sauth_command_only_fetches_sauth(self):
         with patch.object(
-            bot, "_check_resource_restrict", new_callable=AsyncMock
-        ) as check_restrict, patch.object(
+            bot._shared_cd, "check_rate_limit", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
             bot.sauth, "get_sauth", new_callable=AsyncMock
         ) as get_sauth, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
         ) as get_credentials, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
-            check_restrict.return_value = True
             get_sauth.return_value = (True, "Sauth: token-only")
             send_result.return_value = True
 
@@ -205,6 +220,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         send_result.assert_awaited_once()
         self.assertEqual(send_result.await_args.args[2], "sauth")
         self.assertEqual(send_result.await_args.args[5], "Sauth: token-only")
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 495)
 
     async def test_group_resource_request_still_requires_bound_email(self):
         group_ctx = {
@@ -212,6 +228,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             "user_openid": self.user_id,
             "group_openid": "group-openid",
             "msg_id": "msg-group",
+            "limit_user_id": self.user_id,
         }
         with patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
@@ -226,42 +243,26 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         require_email.assert_awaited_once_with(group_ctx, self.user_id)
         get_credentials.assert_not_awaited()
 
-    async def test_restricted_4399_does_not_call_upstream(self):
+    async def test_insufficient_points_4399_does_not_call_upstream(self):
+        bot._sign_data[self.user_id]["points"] = 1
         with patch.object(
-            bot._state_backend,
-            "get_resource_limit_status",
-            return_value={
-                "blocked": True,
-                "count": 1,
-                "limit": 1,
-                "window": 86400,
-                "reset_after": 3661,
-            },
-        ), patch.object(bot, "_require_bound_email", new_callable=AsyncMock) as require_email, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
         ) as get_credentials, patch.object(
             bot, "reply", new_callable=AsyncMock
         ) as reply:
-            require_email.return_value = True
-
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
         get_credentials.assert_not_awaited()
-        reply.assert_awaited_once_with(
-            self.ctx,
-            "已达到获取上限\n当前获取：1/1\n限额刷新：1h1min1s",
-        )
+        self.assertIn("积分不足", reply.await_args.args[1])
+        self.assertIn("2 积分", reply.await_args.args[1])
 
-    async def test_successful_4399_records_restrict_usage(self):
+    async def test_successful_4399_records_usage_and_spends_points(self):
         with patch.object(
-            bot._state_backend,
-            "get_resource_limit_status",
-            side_effect=[
-                {"blocked": False, "count": 0, "limit": 1, "window": 86400, "reset_after": 0},
-                {"blocked": True, "count": 1, "limit": 1, "window": 86400, "reset_after": 86400},
-            ],
-        ), patch.object(bot._state_backend, "record_resource_usage") as record_usage, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
@@ -275,8 +276,9 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/4399")
 
         self.assertTrue(handled)
-        record_usage.assert_called_once_with("4399", self.user_id)
-        self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
+        record_usage.assert_called_once_with("4399", self.user_id, ctx=self.ctx)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 498)
+        self.assertIn("剩余积分：498", send_result.await_args.kwargs["quota_text"])
 
     async def test_concurrent_4399_requests_for_same_user_fetch_once(self):
         ctx_a = dict(self.ctx, msg_id="msg-resource-a")
@@ -287,15 +289,14 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             return True, "token"
 
         with patch.object(
-            bot, "_check_resource_restrict", new_callable=AsyncMock
-        ) as check_restrict, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
         ) as get_credentials, patch.object(
             bot._state_backend, "record_resource_usage"
         ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
-            check_restrict.return_value = True
             get_credentials.side_effect = slow_get_sauth
             send_result.return_value = True
 
@@ -306,7 +307,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handled, [True, True])
         get_credentials.assert_awaited_once()
-        record_usage.assert_called_once_with("4399", self.user_id)
+        record_usage.assert_called_once_with("4399", self.user_id, ctx=ctx_a)
         send_result.assert_awaited_once()
 
     async def test_concurrent_private_and_group_4399_requests_both_deliver(self):
@@ -316,6 +317,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             "user_openid": self.user_id,
             "group_openid": "group-openid",
             "msg_id": "msg-group-4399",
+            "limit_user_id": self.user_id,
         }
 
         async def slow_get_sauth():
@@ -325,16 +327,15 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
-            bot, "_check_resource_restrict", new_callable=AsyncMock
-        ) as check_restrict, patch.object(
             bot.sauth, "get_4399_credentials", new_callable=AsyncMock
         ) as get_credentials, patch.object(
             bot._state_backend, "record_resource_usage"
         ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
             require_email.return_value = True
-            check_restrict.return_value = True
             get_credentials.side_effect = slow_get_sauth
             send_result.return_value = True
 
@@ -378,32 +379,22 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             "已达到获取上限\n当前获取：1/1\n限额刷新：1min0s",
         )
 
-    async def test_restricted_163_does_not_call_upstream(self):
+    async def test_hourly_cooldown_163_does_not_call_upstream(self):
         with patch.object(
-            bot._state_backend,
-            "get_resource_limit_status",
-            return_value={
-                "blocked": True,
-                "count": 1,
-                "limit": 1,
-                "window": 86400,
-                "reset_after": 59,
-            },
-        ), patch.object(bot, "_require_bound_email", new_callable=AsyncMock) as require_email, patch.object(
+            bot._shared_cd, "is_banned", return_value=(False, 0, 0)
+        ), patch.object(
+            bot._shared_cd, "check_cooldown", return_value=(True, 1800)
+        ) as check_cooldown, patch.object(
             bot.sauth, "get_163_credentials", new_callable=AsyncMock
         ) as get_163_credentials, patch.object(
             bot, "reply", new_callable=AsyncMock
         ) as reply:
-            require_email.return_value = True
-
             handled = await bot.handle_command(self.ctx, "/163")
 
         self.assertTrue(handled)
         get_163_credentials.assert_not_awaited()
-        reply.assert_awaited_once_with(
-            self.ctx,
-            "已达到获取上限\n当前获取：1/1\n限额刷新：59s",
-        )
+        self.assertIn("每小时只能提取 1 次", reply.await_args.args[1])
+        self.assertIn("30分0秒", reply.await_args.args[1])
 
     async def test_successful_nfa_records_restrict_usage(self):
         with patch.object(
@@ -438,23 +429,18 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
         record_usage.assert_called_once_with("nfa", self.user_id)
         self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
 
-    async def test_successful_163_records_restrict_usage(self):
+    async def test_successful_163_records_usage_and_spends_points(self):
         with patch.object(
-            bot._state_backend,
-            "get_resource_limit_status",
-            side_effect=[
-                {"blocked": False, "count": 0, "limit": 1, "window": 86400, "reset_after": 0},
-                {"blocked": True, "count": 1, "limit": 1, "window": 86400, "reset_after": 86400},
-            ],
-        ), patch.object(bot._state_backend, "record_resource_usage") as record_usage, patch.object(
             bot._shared_cd, "is_banned", return_value=(False, 0, 0)
         ), patch.object(
             bot._shared_cd, "check_cooldown", return_value=(False, 0)
-        ), patch.object(
-            bot._shared_cd, "check_hour_limit", return_value=(False, 0)
-        ), patch.object(
+        ) as check_cooldown, patch.object(
             bot._shared_cd, "record_usage"
-        ), patch.object(
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_state, patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
             bot.sauth, "get_163_credentials", new_callable=AsyncMock
@@ -468,27 +454,25 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/163")
 
         self.assertTrue(handled)
-        record_usage.assert_called_once_with("163", self.user_id)
-        self.assertIn("当前获取：1/1", send_result.await_args.kwargs["quota_text"])
+        check_cooldown.assert_called_once_with("163", self.user_id, bot.SAUTH_163_COOLDOWN)
+        record_state.assert_called_once_with("163", self.user_id, ctx=self.ctx)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 450)
+        self.assertIn("剩余积分：450", send_result.await_args.kwargs["quota_text"])
 
-    async def test_resource_restrict_uses_global_limit_user_id(self):
+    async def test_points_spending_uses_global_limit_user_id(self):
         self.ctx["limit_user_id"] = "global-user-openid"
+        bot._sign_data["global-user-openid"] = {"points": 60, "streak": 0, "last": ""}
         with patch.object(
-            bot._state_backend,
-            "get_resource_limit_status",
-            side_effect=[
-                {"blocked": False, "count": 0, "limit": 1, "window": 86400, "reset_after": 0},
-                {"blocked": True, "count": 1, "limit": 1, "window": 86400, "reset_after": 86400},
-            ],
-        ) as check_limit, patch.object(bot._state_backend, "record_resource_usage") as record_usage, patch.object(
             bot._shared_cd, "is_banned", return_value=(False, 0, 0)
         ), patch.object(
             bot._shared_cd, "check_cooldown", return_value=(False, 0)
         ), patch.object(
-            bot._shared_cd, "check_hour_limit", return_value=(False, 0)
-        ), patch.object(
             bot._shared_cd, "record_usage"
-        ), patch.object(
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
+            bot._state_backend, "record_resource_usage"
+        ) as record_state, patch.object(
             bot, "_require_bound_email", new_callable=AsyncMock
         ) as require_email, patch.object(
             bot.sauth, "get_163_credentials", new_callable=AsyncMock
@@ -502,8 +486,9 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             handled = await bot.handle_command(self.ctx, "/163")
 
         self.assertTrue(handled)
-        self.assertEqual(check_limit.call_args_list[0].args, ("163", "global-user-openid"))
-        record_usage.assert_called_once_with("163", "global-user-openid")
+        record_state.assert_called_once_with("163", "global-user-openid", ctx=self.ctx)
+        self.assertEqual(bot._sign_data["global-user-openid"]["points"], 10)
+        self.assertEqual(bot._sign_data[self.user_id]["points"], 500)
 
     async def test_concurrent_163_requests_for_same_user_fetch_once(self):
         ctx_a = dict(self.ctx, msg_id="msg-163-a")
@@ -514,23 +499,20 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
             return True, "account: mail@example.com"
 
         with patch.object(
-            bot, "_check_resource_restrict", new_callable=AsyncMock
-        ) as check_restrict, patch.object(
             bot._shared_cd, "is_banned", return_value=(False, 0, 0)
         ), patch.object(
             bot._shared_cd, "check_cooldown", return_value=(False, 0)
         ), patch.object(
-            bot._shared_cd, "check_hour_limit", return_value=(False, 0)
-        ), patch.object(
             bot._shared_cd, "record_usage"
-        ), patch.object(
+        ) as record_usage, patch.object(
+            bot._shared_cd, "record_rate_usage"
+        ) as record_rate, patch.object(
             bot.sauth, "get_163_credentials", new_callable=AsyncMock
         ) as get_163_credentials, patch.object(
             bot._state_backend, "record_resource_usage"
-        ) as record_usage, patch.object(
+        ) as record_usage_state, patch.object(
             bot, "_send_resource_result", new_callable=AsyncMock
         ) as send_result:
-            check_restrict.return_value = True
             get_163_credentials.side_effect = slow_get_163
             send_result.return_value = True
 
@@ -541,7 +523,7 @@ class ResourceRestrictCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(handled, [True, True])
         get_163_credentials.assert_awaited_once()
-        record_usage.assert_called_once_with("163", self.user_id)
+        record_usage_state.assert_called_once_with("163", self.user_id, ctx=ctx_a)
         send_result.assert_awaited_once()
 
     async def test_stock_uses_163_inventory_api(self):

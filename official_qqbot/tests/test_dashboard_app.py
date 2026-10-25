@@ -426,11 +426,13 @@ class DashboardAppTests(unittest.TestCase):
         text = self.client.get("/dashboard/limits").text
         self.assertIn("资源用量总览", text)
         self.assertIn("用户用量明细", text)
+        self.assertIn("积分规则", text)
+        self.assertIn("积分榜", text)
         self.assertIn("近 24 小时", text)
         self.assertIn("不能相加", text)
         self.assertIn("1 / 3", text)
         self.assertIn("可继续获取", text)
-        self.assertIn("最早一条记录释放", text)
+        self.assertIn("固定积分制", text)
         self.assertNotIn('data-chart-type', text)
 
     def test_limits_filters_are_server_rendered_and_escape_user_input(self):
@@ -461,18 +463,19 @@ class DashboardAppTests(unittest.TestCase):
 
     def test_rule_view_prefills_current_values_and_retains_invalid_input(self):
         self._login()
-        self.app.state.control_service.set_resource_limit("4399", 27, "hour")
+        self.app.state.control_service.set_resource_limit("nfa", 27, "hour")
         usage = self.client.get('/dashboard/limits').text
+        self.assertNotIn('id="count-nfa"', usage)
         self.assertNotIn('id="count-4399"', usage)
         rules = self.client.get('/dashboard/limits?view=rules').text
         self.assertIn('value="27"', rules)
         self.assertIn('<option value="hour" selected>', rules)
         self.assertNotIn('id="usage-query"', rules)
-        invalid = self.client.post('/dashboard/resource-limits', data={"resource": "4399", "limit_count": "0", "window_unit": "hour"})
+        invalid = self.client.post('/dashboard/resource-limits', data={"resource": "nfa", "limit_count": "0", "window_unit": "hour"})
         self.assertEqual(invalid.status_code, 400)
-        self.assertIn('id="rule-4399" open', invalid.text)
+        self.assertIn('id="rule-nfa" open', invalid.text)
         self.assertIn('value="0"', invalid.text)
-        self.assertEqual(self.app.state.control_service.get_resource_limit('4399')['limit_count'], 27)
+        self.assertEqual(self.app.state.control_service.get_resource_limit('nfa')['limit_count'], 27)
 
     def test_log_view_selects_one_record_type_and_handles_unknown_view(self):
         self._login()

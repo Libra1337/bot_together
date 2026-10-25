@@ -91,9 +91,9 @@ def adapt_message_event(
             return None
         member_openid = author.get("member_openid") or author.get("id", "")
         limit_user_id = (
-            author.get("user_openid")
-            or author.get("union_openid")
+            author.get("union_openid")
             or author.get("union_user_account")
+            or author.get("user_openid")
             or member_openid
         )
         return MessageEvent(
@@ -114,6 +114,11 @@ def adapt_message_event(
         raw_content = data.get("content", "").strip()
         author = data.get("author", {})
         user_openid = author.get("user_openid", "")
+        limit_user_id = (
+            author.get("union_openid")
+            or author.get("union_user_account")
+            or user_openid
+        )
         return MessageEvent(
             type="c2c",
             group_openid="",
@@ -122,7 +127,7 @@ def adapt_message_event(
             content=raw_content,
             raw_content=raw_content,
             event_type=event_type,
-            limit_user_id=user_openid,
+            limit_user_id=limit_user_id,
             image_urls=_extract_image_urls(data),
         )
 

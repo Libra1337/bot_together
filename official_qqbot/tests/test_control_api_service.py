@@ -77,7 +77,10 @@ class ControlApiServiceTests(unittest.TestCase):
         self.service.record_resource_usage("nfa", "user", used_at=now)
         self.service.record_resource_usage("nfa", "user", used_at=now + timedelta(seconds=1))
         stats = self.service.list_resource_usage_stats(now=now)
-        self.assertEqual(len(stats), 3)
+        self.assertEqual(len(stats), 4)
+        self.assertEqual(
+            {row["resource"] for row in stats}, {"163", "4399", "sauth", "nfa"}
+        )
         nfa = next(row for row in stats if row["resource"] == "nfa")
         self.assertEqual(nfa["counts"]["day"], 1)
         self.assertEqual(nfa["limit_count"], 0)

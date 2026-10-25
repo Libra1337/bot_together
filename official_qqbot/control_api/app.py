@@ -980,10 +980,71 @@ def _bans_page(service: ControlService) -> str:
     return _layout("封禁名单", "bans", body)
 
 
+POINTS_RULES = (
+    ("每日签到", "+50 积分/天"),
+    ("邀请进群（≥10 人）", "+25 积分，每日最多 10 次，同一群不重复奖励"),
+    ("提取 4399 小号", "-2 积分/次，不限次数"),
+    ("提取 sauth", "-5 积分/次，1 分钟最多 5 次"),
+    ("提取 163 小号", "-50 积分/次，1 小时最多 1 次"),
+)
+_POINTS_BASED_RESOURCES = {"4399", "sauth", "163"}
+
+
+def _read_sign_data() -> dict:
+    path = _local_state_dir() / "sign_official.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _points_panels() -> str:
+    sign_data = _read_sign_data()
+    rules_rows = "".join(
+        f"<tr><td>{html.escape(name)}</td><td>{html.escape(rule)}</td></tr>"
+        for name, rule in POINTS_RULES
+    )
+    accounts = [
+        (key, info)
+        for key, info in sign_data.items()
+        if isinstance(info, dict) and not info.get("merged_into")
+    ]
+    users = sorted(
+        accounts, key=lambda item: int(item[1].get("points", 0) or 0), reverse=True
+    )[:20]
+    if users:
+        rows = "".join(
+            f'<tr><td><code>{html.escape(key[:16])}…</code></td>'
+            f'<td class="numeric">{int(info.get("points", 0) or 0):,}</td>'
+            f'<td class="numeric">{int(info.get("streak", 0) or 0)}</td>'
+            f'<td>{html.escape(str(info.get("last", "")))}</td></tr>'
+            for key, info in users
+        )
+        board = (
+            '<div class="table-wrap"><table><caption class="sr-only">积分余额排行</caption>'
+            '<thead><tr><th scope="col">用户 OpenID</th><th class="numeric" scope="col">积分</th>'
+            '<th class="numeric" scope="col">连签天数</th><th scope="col">最近签到</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
+        )
+        span = f"{len(accounts):,} 位用户"
+    else:
+        board = '<p class="empty">暂无签到数据，用户发送「签到」后这里会显示余额。</p>'
+        span = ""
+    return f'''<section class="panel">
+      <div class="panel-head"><div><h2>积分规则</h2><p>小号资源已从每日发放额度改为固定积分制，积分按用户唯一身份（union id）记账，换群不换账户。</p></div></div>
+      <div class="table-wrap"><table><caption class="sr-only">积分规则</caption><thead><tr><th scope="col">行为</th><th scope="col">积分</th></tr></thead><tbody>{rules_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>积分榜 TOP20</h2><span>{span}</span></div></div>
+      {board}
+    </section>'''
+
+
 def _limits_page(service: ControlService, params=None, error: str = "", form=None) -> str:
     params = params or {}
     resource = str(params.get("resource", ""))
-    if resource not in {"163", "4399", "nfa"}:
+    if resource not in {"163", "4399", "sauth", "nfa"}:
         resource = ""
     query = str(params.get("q", ""))[:128].strip()
     try:
@@ -996,14 +1057,19 @@ def _limits_page(service: ControlService, params=None, error: str = "", form=Non
     notices = f'<div class="notice error" role="alert">{html.escape(error)}</div>' if error else ""
     if params.get("saved") == "1":
         notices += '<div class="notice success" role="status">限制规则已保存，对所有群和私聊生效。</div>'
+    notices += (
+        '<div class="notice" role="status">4399 / sauth / 163 已改为固定积分制，'
+        "不再受下方限额约束；限额规则目前仅对 NFA 生效。</div>"
+    )
     tabs = '<nav class="mc-tabs" aria-label="获取限制视图">' + ''.join(
         f'<a href="{url}" class="{ "is-active" if active else ""}"' + (' aria-current="page"' if active else '') + f'>{label}</a>'
-        for url, label, active in [("/dashboard/limits", "用户用量", not rules_view), ("/dashboard/limits?view=rules", "限制规则", rules_view)]
+        for url, label, active in [("/dashboard/limits", "积分与用量", not rules_view), ("/dashboard/limits?view=rules", "限制规则（NFA）", rules_view)]
     ) + '</nav>'
     if rules_view:
+        nfa_stats = [item for item in stats if item["resource"] not in _POINTS_BASED_RESOURCES]
         content = f'''<section class="panel">
-          <div class="panel-head"><div><h2>限制规则</h2><p>选择资源以修改个人额度。已有获取记录会继续计入。</p></div></div>
-          {usage_ui.rule_list(stats, form)}
+          <div class="panel-head"><div><h2>限制规则</h2><p>小号资源已改为积分制，这里仅管理 NFA 的获取额度。</p></div></div>
+          {usage_ui.rule_list(nfa_stats, form)}
           <p class="field-note">限额在群聊与私聊间共用，按滚动周期释放。</p>
           <details class="mc-reset"><summary>重置获取记录</summary>
             <p>将清空所有资源的用量历史，所有用户重新获得额度。此操作不可撤销。</p>
@@ -1013,18 +1079,19 @@ def _limits_page(service: ControlService, params=None, error: str = "", form=Non
     else:
         users = service.list_resource_user_usage(resource=resource, query=query, page=page, now=now)
         refresh = html.escape(urlencode({"resource": resource, "q": query, "page": page}))
-        content = f'''<section class="panel" id="user-usage">
+        content = f'''{_points_panels()}
+        <section class="panel" id="user-usage">
           <div class="mc-toolbar-title"><div><h2>用户用量明细</h2><span>{users['total']:,} 条有效用量</span></div><a class="button ghost" href="/dashboard/limits?{refresh}">刷新数据</a></div>
           {usage_ui.filters(resource, query)}
           {usage_ui.user_usage_table(users)}
           {usage_ui.pagination(users, resource, query)}
-          <p class="field-note">按个人滚动周期统计，群聊与私聊共用额度。下次释放是最早一条记录释放的时间，并非全部额度重置。</p>
+          <p class="field-note">统计每次成功提取；积分制资源的个人可用次数即其余额。</p>
         </section>
         <details class="mc-disclosure"><summary>资源用量总览<span>查看各时间窗口的全体获取次数</span></summary>
           {usage_ui.usage_summary(stats)}
           <p class="field-note">滚动窗口互有重叠，不能相加；全体次数不代表个人已用额度。</p>
         </details>'''
-    return _layout("获取限制", "limits", notices + tabs + content)
+    return _layout("积分与限额", "limits", notices + tabs + content)
 
 
 def _logs_page(service: ControlService, params=None) -> str:

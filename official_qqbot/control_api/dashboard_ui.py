@@ -9,7 +9,7 @@ from pathlib import Path
 _DIRECTORY = Path(__file__).resolve().parent
 _NAVIGATION = (
     ("overview", "/dashboard", "控制台", "工作空间"),
-    ("limits", "/dashboard/limits", "获取限制", "工作空间"),
+    ("limits", "/dashboard/limits", "积分与限额", "工作空间"),
     ("users", "/dashboard/users", "用户列表", "工作空间"),
     ("permissions", "/dashboard/permissions", "权限管理", "工作空间"),
     ("bans", "/dashboard/bans", "封禁名单", "工作空间"),
@@ -21,7 +21,7 @@ _NAVIGATION = (
 )
 _DESCRIPTIONS = {
     "overview": "查看服务概况、资源使用情况与最近的管理动态。",
-    "limits": "查看资源获取情况，管理每位用户的获取额度。",
+    "limits": "查看积分规则与余额排行，管理 NFA 等资源的获取额度。",
     "users": "查看用户资料、使用记录与账户状态。",
     "permissions": "管理角色授权，让每位成员拥有合适的访问权限。",
     "bans": "查看和管理受限用户，保持服务有序运行。",

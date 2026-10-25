@@ -46,7 +46,7 @@ RESOURCE_STATS_WINDOWS = {
     "month": 30 * 86400,
     "year": 365 * 86400,
 }
-RESOURCE_NAMES = {"163", "4399", "nfa"}
+RESOURCE_NAMES = {"163", "4399", "sauth", "nfa"}
 ROLE_ADMIN = "admin"
 ROLE_STAFF = "staff"
 

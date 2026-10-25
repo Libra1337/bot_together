@@ -44,8 +44,8 @@ from handlers import fun, bilibili, douyin, music, github
 from handlers import email_sender
 
 # ====== 版本 ======
-BOT_VERSION = "1.2.0"
-BOT_BUILD_DATE = "2026-10-05"
+BOT_VERSION = "1.3.0"
+BOT_BUILD_DATE = "2026-10-25"
 _start_time: float = _time_mod.time()
 
 # ====== 日志 ======
@@ -530,8 +530,16 @@ _image_cooldowns: dict[str, float] = {}
 NFA_COOLDOWN = 1800
 _NFA_HOUR_LIMIT = 5
 _NFA_BAN_DURATION = 86400
-_163_HOUR_LIMIT = 5
-_163_BAN_DURATION = 86400
+
+# ====== 积分制常量（2026-10-25 起固定积分发放/消耗） ======
+SIGN_IN_POINTS = 50
+EXTRACT_POINTS_COST = {"4399": 2, "sauth": 5, "163": 50}
+GROUP_ADD_REWARD_POINTS = 25
+GROUP_ADD_MIN_MEMBERS = 10
+GROUP_ADD_DAILY_LIMIT = 10
+SAUTH_RATE_LIMIT = 5  # 每分钟最多 5 次
+SAUTH_RATE_WINDOW = 60
+SAUTH_163_COOLDOWN = 3600  # 163 每小时最多 1 次
 
 _RESTRICT_FEATURES = {"163", "4399", "nfa"}
 _RESTRICT_UNITS = {"min", "hour", "day", "month", "quarter", "year"}
@@ -682,6 +690,9 @@ _KNOWN_COMMANDS = {
     "排行榜",
     "积分榜",
     "签到排行",
+    "积分",
+    "余额",
+    "查积分",
     "点歌",
     "听歌",
     "来首歌",
@@ -713,6 +724,7 @@ _FUZZY_SPECS = [
     ("status", "查看运行状态"),
     ("datalog", "查看更新日志"),
     ("签到", "每日签到"),
+    ("积分", "查询积分余额"),
     ("运势", "查看今日运势"),
     ("今日人品", "查看人品值"),
     ("帮助", "查看功能列表"),
@@ -869,18 +881,225 @@ def do_sign_in(user_openid):
     else:
         user["streak"] = 1
 
-    bonus = min(user["streak"], 7)
-    points = 10 + bonus
-    user["points"] = user.get("points", 0) + points
+    user["points"] = user.get("points", 0) + SIGN_IN_POINTS
     user["last"] = today
     _sign_data[user_openid] = user
     _save_sign(_sign_data)
     return (
         f"签到成功喵~\n"
-        f"获得 {points} 积分（含连签加成 +{bonus}）\n"
+        f"获得 {SIGN_IN_POINTS} 积分\n"
         f"当前积分：{user['points']}\n"
         f"连续签到：{user['streak']}天"
     )
+
+
+def get_user_points(user_openid) -> int:
+    user = _sign_data.get(user_openid) or {}
+    return int(user.get("points", 0) or 0)
+
+
+def _points_shortage_text(cost: int, balance: int) -> str:
+    return (
+        f"积分不足喵~提取该资源需要 {cost} 积分，你当前有 {balance} 积分\n"
+        f"每日签到 +{SIGN_IN_POINTS}；邀请我进 10 人以上的群 +{GROUP_ADD_REWARD_POINTS}"
+        f"（每天最多 {GROUP_ADD_DAILY_LIMIT} 次）"
+    )
+
+
+def try_spend_points(user_openid, cost: int) -> tuple[bool, int]:
+    """余额足够则立即扣除，返回 (是否成功, 剩余积分)"""
+    user = _sign_data.setdefault(
+        user_openid, {"points": 0, "streak": 0, "last": ""}
+    )
+    balance = int(user.get("points", 0) or 0)
+    if balance < cost:
+        return False, balance
+    user["points"] = balance - cost
+    _save_sign(_sign_data)
+    return True, user["points"]
+
+
+def award_group_add_points(operator_openid: str, group_openid: str) -> tuple[str, int]:
+    """
+    拉群奖励结算：群人数达标且当日次数未超限时 +25 积分。
+    返回 (结果原因, 本次获得积分)
+    """
+    import datetime
+
+    today = datetime.date.today().isoformat()
+    user = _sign_data.setdefault(
+        operator_openid, {"points": 0, "streak": 0, "last": ""}
+    )
+    rewarded = user.setdefault("rewarded_groups", [])
+    if group_openid in rewarded:
+        return "duplicate_group", 0
+    if user.get("group_add_last") != today:
+        user["group_add_last"] = today
+        user["group_add_count"] = 0
+    if int(user.get("group_add_count", 0) or 0) >= GROUP_ADD_DAILY_LIMIT:
+        return "daily_limit", 0
+    user["group_add_count"] = int(user.get("group_add_count", 0) or 0) + 1
+    user["points"] = int(user.get("points", 0) or 0) + GROUP_ADD_REWARD_POINTS
+    rewarded.append(group_openid)
+    if len(rewarded) > 200:
+        del rewarded[: len(rewarded) - 200]
+    _save_sign(_sign_data)
+    return "ok", GROUP_ADD_REWARD_POINTS
+
+
+def points_balance_text(user_openid) -> str:
+    user = _sign_data.get(user_openid) or {}
+    used_today = int(user.get("group_add_count", 0) or 0) \
+        if user.get("group_add_last") == _today_str() else 0
+    return (
+        f"当前积分：{user.get('points', 0)}\n"
+        f"━━━ 积分规则 ━━━\n"
+        f"签到 +{SIGN_IN_POINTS}/天\n"
+        f"邀请我进 10 人以上群 +{GROUP_ADD_REWARD_POINTS}"
+        f"（今日拉群奖励 {used_today}/{GROUP_ADD_DAILY_LIMIT} 次）\n"
+        f"提取 4399 小号 -{EXTRACT_POINTS_COST['4399']} 积分（不限次）\n"
+        f"提取 sauth -{EXTRACT_POINTS_COST['sauth']} 积分（1 分钟最多 {SAUTH_RATE_LIMIT} 次）\n"
+        f"提取 163 小号 -{EXTRACT_POINTS_COST['163']} 积分（1 小时最多 1 次）"
+    )
+
+
+def _today_str() -> str:
+    import datetime
+
+    return datetime.date.today().isoformat()
+
+
+# ====== 用户身份归一：union_openid 是唯一积分账户键 ======
+# 同一用户在不同群/私聊拿到的 openid 不同；积分一律记到 union_openid 上，
+# 场景 openid -> union 的映射随消息到达自动学习。
+IDENTITY_FILE = os.path.join(_BOT_DIR, "data", "identity_map.json")
+
+
+def _load_identity() -> dict:
+    try:
+        if os.path.exists(IDENTITY_FILE):
+            with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_identity(data: dict):
+    try:
+        os.makedirs(os.path.dirname(IDENTITY_FILE), exist_ok=True)
+        with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _log.warning(f"[身份] 保存映射失败: {e}")
+
+
+_identity_map: dict = _load_identity()
+
+
+def _pending_rewards() -> list:
+    pending = _identity_map.get("_pending")
+    if not isinstance(pending, list):
+        pending = []
+        _identity_map["_pending"] = pending
+    return pending
+
+
+def _learn_identity(scenario_openid: str, union_openid: str) -> list[str]:
+    """记录 场景openid -> union 映射，返回本次新学到的 openid（触发老积分合并）"""
+    if not scenario_openid or not union_openid or scenario_openid == union_openid:
+        return []
+    if _identity_map.get(scenario_openid) == union_openid:
+        return []
+    _identity_map[scenario_openid] = union_openid
+    _save_identity(_identity_map)
+    _log.info(f"[身份] {scenario_openid[:8]}... -> union {union_openid[:8]}...")
+    return [scenario_openid]
+
+
+def _merge_legacy_points(union_openid: str, openids: list[str]) -> None:
+    """把旧 openid 账户里剩余的积分一次性并入 union 账户"""
+    account = _sign_data.setdefault(
+        union_openid, {"points": 0, "streak": 0, "last": ""}
+    )
+    gained = 0
+    for openid in openids:
+        legacy = _sign_data.get(openid)
+        if not isinstance(legacy, dict) or legacy.get("merged_into"):
+            continue
+        gained += int(legacy.get("points", 0) or 0)
+        legacy["points"] = 0
+        legacy["merged_into"] = union_openid
+    if gained > 0:
+        account["points"] = int(account.get("points", 0) or 0) + gained
+        _save_sign(_sign_data)
+        _log.info(f"[身份] 老账户积分合并 -> {union_openid[:8]}... +{gained}")
+
+
+def _queue_pending_reward(group_openid: str, member_openid: str) -> None:
+    """拉群时还不知道操作者的 union：先挂账，等他在群里发言后入账"""
+    pending = _pending_rewards()
+    pending.append(
+        {
+            "group": group_openid,
+            "member": member_openid,
+            "points": GROUP_ADD_REWARD_POINTS,
+            "ts": int(_time_mod.time()),
+        }
+    )
+    _save_identity(_identity_map)
+    _log.info(
+        f"[拉群奖励] 待入账 group={group_openid[:8]}... op={member_openid[:8]}..."
+    )
+
+
+def _flush_pending_rewards(group_openid: str, member_openid: str, union_openid: str) -> int:
+    """该成员在本群首次发言（身份已知）时，把挂账的拉群奖励入账，返回入账积分"""
+    pending = _pending_rewards()
+    remaining, awarded = [], 0
+    for item in pending:
+        if (
+            isinstance(item, dict)
+            and item.get("group") == group_openid
+            and item.get("member") == member_openid
+        ):
+            reason, gained = award_group_add_points(
+                union_openid, str(item.get("group", ""))
+            )
+            if reason == "ok":
+                awarded += int(gained or 0)
+        else:
+            remaining.append(item)
+    if len(remaining) != len(pending):
+        if remaining:
+            _identity_map["_pending"] = remaining
+        else:
+            _identity_map.pop("_pending", None)
+        _save_identity(_identity_map)
+    return awarded
+
+
+def resolve_message_identity(event) -> int:
+    """
+    每条消息到达后调用：学习 openid->union 映射、合并老积分、入账挂账奖励。
+    返回本次入账的拉群奖励积分（用于提示用户）。
+    """
+    scenario_openid = event.user_openid
+    union_openid = event.limit_user_id
+    if not scenario_openid or not union_openid or scenario_openid == union_openid:
+        return 0
+    learned = _learn_identity(scenario_openid, union_openid)
+    if learned:
+        _merge_legacy_points(union_openid, learned)
+    awarded = 0
+    if getattr(event, "group_openid", ""):
+        awarded = _flush_pending_rewards(event.group_openid, scenario_openid, union_openid)
+        if awarded:
+            balance = get_user_points(union_openid)
+            _log.info(
+                f"[拉群奖励] 挂账入账 +{awarded} union={union_openid[:8]}... balance={balance}"
+            )
+    return awarded
 
 
 # ====== Access Token ======
@@ -1380,8 +1599,10 @@ async def handle_command(ctx, content):
             (
                 "Ciallo 曦曦官方Bot 指令列表喵~\n"
                 "━━━ 日常功能 ━━━\n"
-                "签到 / 打卡 — 每日签到得积分\n"
-                "排行榜 — 查看签到排名\n"
+                "签到 / 打卡 — 每日签到 +50 积分\n"
+                "积分 — 查询余额与积分规则\n"
+                "邀请我进群 — 10 人以上群 +25 积分（每日最多 10 次）\n"
+                "排行榜 — 查看积分排名\n"
                 "运势 / 抽签 — 查看今日运势\n"
                 "今日人品 — 每日人品值\n"
                 "XX天气 — 查询天气（如：北京天气）\n"
@@ -1389,11 +1610,11 @@ async def handle_command(ctx, content):
                 "点歌 歌名 — 搜索歌曲\n"
                 "点歌 — 进入点歌模式，再输歌名\n"
                 "搜索GitHub 关键词 — 搜索仓库\n"
-                "━━━ 小号/资源 ━━━\n"
+                "━━━ 小号/资源（消耗积分） ━━━\n"
                 "nfa — 获取 NFA Token\n"
-                "4399 — 获取 4399 账号密码\n"
-                "sauth — 只获取 4399 Sauth\n"
-                "163 — 领取 163 小号\n"
+                "4399 — 获取 4399 账号密码（2 积分，不限次）\n"
+                "sauth — 只获取 4399 Sauth（5 积分，1 分钟最多 5 次）\n"
+                "163 — 领取 163 小号（50 积分，1 小时最多 1 次）\n"
                 "stock — 查看全部库存\n"
                 "/bind 邮箱/QQ号 — 绑定资源接收地址（群聊领取前必需）\n"
                 "/unbind — 取消邮箱绑定\n"
@@ -1639,10 +1860,15 @@ async def handle_command(ctx, content):
             await reply(ctx, "你还没有绑定邮箱喵~")
         return True
 
-    # 签到
+    # 签到（积分记到 union 账户，换群/私聊都是同一个账户）
     if lower in ("签到", "打卡"):
-        result = do_sign_in(user_id)
+        result = do_sign_in(limit_user_id)
         await reply(ctx, result)
+        return True
+
+    # 积分查询
+    if lower in ("积分", "余额", "我的积分", "查积分", "points", "/points"):
+        await reply(ctx, points_balance_text(limit_user_id))
         return True
 
     # 运势
@@ -1711,11 +1937,15 @@ async def handle_command(ctx, content):
         _log.info(f"[NFA] {user_id[:8]}...")
         return True
 
-    # 4399
+    # 4399（不限次，固定积分消耗）
     if lower in ("4399", "/4399"):
         if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
-        if not await _check_resource_restrict(ctx, "4399", limit_user_id):
+
+        cost = EXTRACT_POINTS_COST["4399"]
+        balance = get_user_points(limit_user_id)
+        if balance < cost:
+            await reply(ctx, _points_shortage_text(cost, balance))
             return True
 
         if not _begin_resource_request("4399", limit_user_id, ctx):
@@ -1724,8 +1954,14 @@ async def handle_command(ctx, content):
 
         success, result = await sauth.get_4399_credentials()
         if success:
-            _record_resource_restrict("4399", limit_user_id)
-            quota_text = _resource_success_quota_line("4399", limit_user_id)
+            spent, remaining = try_spend_points(limit_user_id, cost)
+            if not spent:
+                _log.warning(
+                    f"[4399] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                )
+            _shared_cd.record_rate_usage("4399", limit_user_id)
+            _state_backend.record_resource_usage("4399", limit_user_id, ctx=ctx)
+            quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             result += "\n爱来自Miracle小号网站喵~"
             await _send_resource_result(
                 ctx,
@@ -1742,21 +1978,42 @@ async def handle_command(ctx, content):
         _end_resource_request("4399", limit_user_id, ctx)
         return True
 
-    # sauth
+    # sauth（1 分钟最多 5 次，固定积分消耗）
     if lower in ("sauth", "/sauth"):
         if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
-        if not await _check_resource_restrict(ctx, "4399", limit_user_id):
+
+        over, used, retry_after = _shared_cd.check_rate_limit(
+            "sauth", limit_user_id, SAUTH_RATE_LIMIT, SAUTH_RATE_WINDOW
+        )
+        if over:
+            await reply(
+                ctx,
+                f"sauth 获取太频繁啦喵~1 分钟最多 {SAUTH_RATE_LIMIT} 次，"
+                f"请 {max(retry_after, 1)} 秒后再试~"
+            )
             return True
 
-        if not _begin_resource_request("4399", limit_user_id, ctx):
+        cost = EXTRACT_POINTS_COST["sauth"]
+        balance = get_user_points(limit_user_id)
+        if balance < cost:
+            await reply(ctx, _points_shortage_text(cost, balance))
+            return True
+
+        if not _begin_resource_request("sauth", limit_user_id, ctx):
             _log.info(f"[ResourceDedup] sauth busy user={limit_user_id[:8]}...")
             return True
 
         success, result = await sauth.get_sauth()
         if success:
-            _record_resource_restrict("4399", limit_user_id)
-            quota_text = _resource_success_quota_line("4399", limit_user_id)
+            spent, remaining = try_spend_points(limit_user_id, cost)
+            if not spent:
+                _log.warning(
+                    f"[sauth] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                )
+            _shared_cd.record_rate_usage("sauth", limit_user_id)
+            _state_backend.record_resource_usage("sauth", limit_user_id, ctx=ctx)
+            quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             await _send_resource_result(
                 ctx,
                 user_id,
@@ -1769,14 +2026,12 @@ async def handle_command(ctx, content):
         else:
             await reply(ctx, result)
         _log.info(f"[Sauth] {user_id[:8]}...")
-        _end_resource_request("4399", limit_user_id, ctx)
+        _end_resource_request("sauth", limit_user_id, ctx)
         return True
 
-    # 163
+    # 163（1 小时最多 1 次，固定积分消耗）
     if lower in ("163", "/163"):
         if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
-            return True
-        if not await _check_resource_restrict(ctx, "163", limit_user_id):
             return True
 
         banned, bh, bm = _shared_cd.is_banned("163", limit_user_id)
@@ -1785,29 +2040,35 @@ async def handle_command(ctx, content):
                 ctx, f"您因疑似偷卡已被临时封禁，剩余 {bh}小时{bm}分钟 后解封喵~"
             )
             return True
-        in_cd, remain = _shared_cd.check_cooldown("163", limit_user_id, 60)
+        in_cd, remain = _shared_cd.check_cooldown("163", limit_user_id, SAUTH_163_COOLDOWN)
         if in_cd:
-            await reply(ctx, f"一分钟内已获取过啦，请{remain}秒后再试喵~")
-            return True
-        over, count = _shared_cd.check_hour_limit(
-            "163", limit_user_id, _163_HOUR_LIMIT, _163_BAN_DURATION
-        )
-        if over:
             await reply(
-                ctx, f"一小时内频繁获取（{count}次），疑似偷卡，已封禁24小时喵~"
+                ctx,
+                f"163 小号每小时只能提取 1 次喵~请 {remain // 60}分{remain % 60}秒 后再试~",
             )
+            return True
+
+        cost = EXTRACT_POINTS_COST["163"]
+        balance = get_user_points(limit_user_id)
+        if balance < cost:
+            await reply(ctx, _points_shortage_text(cost, balance))
             return True
 
         if not _begin_resource_request("163", limit_user_id, ctx):
             _log.info(f"[ResourceDedup] 163 busy user={limit_user_id[:8]}...")
             return True
 
-        _shared_cd.record_usage("163", limit_user_id)
-
         success, result_163 = await sauth.get_163_credentials()
         if success:
-            _record_resource_restrict("163", limit_user_id)
-            quota_text = _resource_success_quota_line("163", limit_user_id)
+            spent, remaining = try_spend_points(limit_user_id, cost)
+            if not spent:
+                _log.warning(
+                    f"[163] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                )
+            _shared_cd.record_usage("163", limit_user_id)
+            _shared_cd.record_rate_usage("163", limit_user_id)
+            _state_backend.record_resource_usage("163", limit_user_id, ctx=ctx)
+            quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             await _send_resource_result(
                 ctx,
                 user_id,
@@ -1889,6 +2150,10 @@ async def handle_command(ctx, content):
                 f"曦曦官方Bot 更新日志\n"
                 f"━━━━━━━━━━━━━━━━━\n"
                 f"v{BOT_VERSION} ({BOT_BUILD_DATE})\n"
+                f"· 资源改为固定积分制：签到 +50/天，拉群 +25（10 人以上群，日上限 10 次）\n"
+                f"· 提取消耗积分：4399=2（不限次）/ sauth=5（1 分钟 5 次）/ 163=50（1 小时 1 次）\n"
+                f"· 新增「积分」指令查询余额\n"
+                f"v1.2.0 (2026-10-05)\n"
                 f"· 官方 Bot 上线，基于 QQ 开放平台 API\n"
                 f"· AI 对话 + 签到/运势/人品/天气\n"
                 f"· NFA/4399/163/库存查询\n"
@@ -1904,11 +2169,16 @@ async def handle_command(ctx, content):
 
     # 排行榜
     if lower in ("排行榜", "积分榜", "签到排行"):
-        if not _sign_data:
+        active_users = {
+            uid: info
+            for uid, info in _sign_data.items()
+            if isinstance(info, dict) and not info.get("merged_into")
+        }
+        if not active_users:
             await reply(ctx, "还没有人签到过喵~")
             return True
         sorted_users = sorted(
-            _sign_data.items(), key=lambda x: x[1].get("points", 0), reverse=True
+            active_users.items(), key=lambda x: x[1].get("points", 0), reverse=True
         )[:10]
         lines = ["签到排行榜 TOP10 喵~", "━━━━━━━━━━━━━━"]
         for i, (uid, info) in enumerate(sorted_users, 1):
@@ -2368,6 +2638,12 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         f"user={event.user_openid[:8]}... images={len(event.image_urls)}: "
         f"{event.content[:50]}"
     )
+    awarded = resolve_message_identity(event)
+    if awarded:
+        await reply(
+            event.to_ctx(),
+            f"拉群奖励 +{awarded} 积分已到账喵~当前积分：{get_user_points(event.limit_user_id)}",
+        )
     await process_message(event.to_ctx(), event.content)
 
 
@@ -2381,10 +2657,100 @@ async def handle_c2c_message(data):
         return
 
     _log.info(
-        f"[私聊] {event.user_openid[:8]}... images={len(event.image_urls)}: "
+        f"[私聊] user={event.user_openid[:8]}... images={len(event.image_urls)}: "
         f"{event.content[:50]}"
     )
+    resolve_message_identity(event)
     await process_message(event.to_ctx(), event.content)
+
+
+async def fetch_group_member_count(group_openid: str) -> int | None:
+    """查询群人数，失败返回 None（官方 /v2/groups/{id}/info 接口）"""
+    if not group_openid:
+        return None
+    headers = await get_auth_header()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{API_BASE}/v2/groups/{group_openid}/info", headers=headers
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return int(data.get("group_member_num", 0) or 0)
+            _log.warning(
+                f"[拉群奖励] 群信息获取失败 {resp.status_code}: {resp.text[:200]}"
+            )
+    except Exception as e:
+        _log.error(f"[拉群奖励] 群信息获取异常: {e}")
+    return None
+
+
+async def handle_group_add_robot(data: dict) -> None:
+    """被拉入新群：群人数 >=10 且当日奖励次数未用尽时，奖励邀请者积分（记到 union 账户）"""
+    group_openid = str(data.get("group_openid", "") or "")
+    operator = str(data.get("op_member_openid", "") or "")
+    if not group_openid or not operator:
+        _log.info(
+            f"[拉群奖励] 事件缺少字段 group={group_openid[:8]}... op={operator[:8]}..."
+        )
+        return
+
+    member_count = await fetch_group_member_count(group_openid)
+    if member_count is None:
+        # 查询失败时既不奖励也不提示，避免误判群人数
+        return
+
+    if member_count < GROUP_ADD_MIN_MEMBERS:
+        _log.info(
+            f"[拉群奖励] 群人数不足 group={group_openid[:8]}... members={member_count}"
+        )
+        await send_group_msg(
+            group_openid,
+            (
+                f"感谢邀请喵~当前群人数 {member_count} 人，"
+                f"达到 {GROUP_ADD_MIN_MEMBERS} 人后邀请奖励才会发放哦~"
+            ),
+            str(data.get("id", "") or ""),
+        )
+        return
+
+    union_openid = str(_identity_map.get(operator, "") or "")
+    if not union_openid:
+        # 还不知道邀请者的统一身份：挂账，等他在本群发言后自动入账
+        _queue_pending_reward(group_openid, operator)
+        await send_group_msg(
+            group_openid,
+            (
+                f"感谢把我拉进群喵~邀请奖励 {GROUP_ADD_REWARD_POINTS} 积分"
+                f"将在邀请者于群内发言后到账~\n"
+                f"（发送「积分」可查余额，「签到」每天 +{SIGN_IN_POINTS}）"
+            ),
+            str(data.get("id", "") or ""),
+        )
+        return
+
+    reason, gained = award_group_add_points(union_openid, group_openid)
+    if reason == "ok":
+        balance = get_user_points(union_openid)
+        _log.info(
+            f"[拉群奖励] +{gained} group={group_openid[:8]}... "
+            f"union={union_openid[:8]}... members={member_count} balance={balance}"
+        )
+        await send_group_msg(
+            group_openid,
+            (
+                f"感谢把我拉进群喵~奖励邀请者 {gained} 积分！\n"
+                f"当前积分：{balance}\n"
+                f"（发送「积分」可查余额，「签到」每天 +{SIGN_IN_POINTS}）"
+            ),
+            str(data.get("id", "") or ""),
+        )
+    elif reason == "daily_limit":
+        _log.info(f"[拉群奖励] 当日奖励次数已用尽 union={union_openid[:8]}...")
+    elif reason == "duplicate_group":
+        _log.info(
+            f"[拉群奖励] 该群已奖励过 union={union_openid[:8]}... group={group_openid[:8]}..."
+        )
 
 
 async def handle_koishi_bridge_payload(payload: dict):
@@ -2507,6 +2873,9 @@ async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None
         await handle_group_message(data, event_type)
     elif event_type == C2C_MESSAGE_CREATE:
         await handle_c2c_message(data)
+    elif event_type == "GROUP_ADD_ROBOT":
+        _log.info("[QQWebhook] GROUP_ADD_ROBOT")
+        await handle_group_add_robot(data)
     elif event_type:
         _log.info(
             f"[QQWebhook] event={event_type} "
@@ -2674,8 +3043,10 @@ async def run_websocket():
                                 asyncio.create_task(handle_group_message(d, t))
                             elif t == C2C_MESSAGE_CREATE:
                                 asyncio.create_task(handle_c2c_message(d))
+                            elif t == "GROUP_ADD_ROBOT":
+                                _log.info("[事件] GROUP_ADD_ROBOT")
+                                asyncio.create_task(handle_group_add_robot(d))
                             elif t in (
-                                "GROUP_ADD_ROBOT",
                                 "GROUP_DEL_ROBOT",
                                 "FRIEND_ADD",
                                 "FRIEND_DEL",

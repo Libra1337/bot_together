@@ -113,6 +113,38 @@ def check_cooldown(
     return False, 0
 
 
+def check_rate_limit(
+    feature: str, user_id, limit: int, window: int
+) -> tuple[bool, int, int]:
+    """
+    滑动窗口频控（只拦截，不封禁）
+    返回 (是否超限, 窗口内已用次数, 距解限秒数)
+    """
+    _load()
+    uid = str(user_id)
+    now = time.time()
+    logs = _section(f"{feature}_rate")
+    recent = [float(ts) for ts in (logs.get(uid) or []) if now - float(ts) < window]
+    logs[uid] = recent
+    _save()
+    if len(recent) >= limit:
+        retry_after = max(0, int(window - (now - min(recent))))
+        return True, len(recent), retry_after
+    return False, len(recent), 0
+
+
+def record_rate_usage(feature: str, user_id) -> None:
+    """记录一次成功获取，供滑动窗口频控与用量统计使用"""
+    _load()
+    uid = str(user_id)
+    now = time.time()
+    logs = _section(f"{feature}_rate")
+    recent = [float(ts) for ts in (logs.get(uid) or []) if now - float(ts) < 3600]
+    recent.append(now)
+    logs[uid] = recent
+    _save()
+
+
 def check_hour_limit(
     feature: str, user_id: int, limit: int, ban_duration: int
 ) -> tuple[bool, int]:

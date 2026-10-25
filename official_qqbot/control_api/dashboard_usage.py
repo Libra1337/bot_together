@@ -6,16 +6,26 @@ from urllib.parse import urlencode
 RANGES = [("second", "近 1 秒"), ("minute", "近 1 分钟"), ("hour", "近 1 小时"),
           ("day", "近 24 小时"), ("month", "近 30 天"), ("year", "近 365 天")]
 UNITS = {"min": "分钟", "hour": "小时", "day": "天", "month": "30 天", "quarter": "90 天", "year": "365 天"}
-NAMES = {"163": "163 小号", "4399": "4399 账号", "nfa": "NFA Token"}
+NAMES = {"163": "163 小号", "4399": "4399 账号", "sauth": "4399 Sauth", "nfa": "NFA Token"}
+POINTS_COST = {"4399": "2 积分/次 · 不限次数", "sauth": "5 积分/次 · 1 分钟最多 5 次", "163": "50 积分/次 · 1 小时最多 1 次"}
+
+
+def _resource_rule_text(item):
+    resource = item["resource"]
+    if resource in POINTS_COST:
+        return f"积分制 · {POINTS_COST[resource]}"
+    if item["limit_count"]:
+        return f'个人限额 · {item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], "")}'
+    return "未设置限额"
 
 
 def resource_list(stats):
     rows = []
     for item in stats:
         resource = item['resource']
-        rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], "")}' if item['limit_count'] else '未设置限额'
+        rule = _resource_rule_text(item)
         rows.append(f'''<div class="mc-resource-row">
-          <div class="mc-resource-title"><h3>{esc(NAMES[resource])}</h3><p>个人限额 · {esc(rule)}</p></div>
+          <div class="mc-resource-title"><h3>{esc(NAMES[resource])}</h3><p>{esc(rule)}</p></div>
           <div class="mc-resource-count"><strong>{item['counts']['day']:,}</strong><small>近 24 小时获取</small></div>
           <a class="button ghost" href="/dashboard/limits?resource={resource}">查看用量<span class="sr-only"> · {esc(NAMES[resource])}</span></a>
         </div>''')
@@ -57,7 +67,12 @@ def usage_summary(stats):
     for item in stats:
         resource = item["resource"]
         counts = item["counts"]
-        rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], item["window_unit"])}' if item["limit_count"] else "未设置"
+        if resource in POINTS_COST:
+            rule = POINTS_COST[resource]
+        elif item["limit_count"]:
+            rule = f'{item["limit_count"]:,} 次 / {UNITS.get(item["window_unit"], item["window_unit"])}'
+        else:
+            rule = "未设置"
         rows.append(f'<tr><td><strong class="resource-name">{esc(resource.upper())}</strong><span class="cell-note">{esc(NAMES.get(resource, resource))}</span></td>'
                     + "".join(f'<td class="numeric">{int(counts.get(key, 0)):,}</td>' for key, _ in RANGES)
                     + f'<td>{rule}<span class="cell-note">每位用户</span></td></tr>')
@@ -101,7 +116,7 @@ def user_usage_table(result):
 
 
 def filters(resource, query):
-    options = ''.join(f'<option value="{key}"{" selected" if key == resource else ""}>{label}</option>' for key, label in [("", "全部资源"), ("163", "163"), ("4399", "4399"), ("nfa", "NFA")])
+    options = ''.join(f'<option value="{key}"{" selected" if key == resource else ""}>{label}</option>' for key, label in [("", "全部资源"), ("163", "163"), ("4399", "4399"), ("sauth", "sauth"), ("nfa", "NFA")])
     return f'''<form class="table-toolbar" method="get" action="/dashboard/limits">
       <div><label for="usage-resource">资源</label><select id="usage-resource" name="resource">{options}</select></div>
       <div><label for="usage-query">查找用户</label><input id="usage-query" name="q" value="{esc(query)}" placeholder="输入 OpenID" maxlength="128" type="search"></div>
