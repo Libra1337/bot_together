@@ -47,6 +47,8 @@ RESOURCE_STATS_WINDOWS = {
     "year": 365 * 86400,
 }
 RESOURCE_NAMES = {"163", "4399", "sauth", "nfa"}
+# 已改为固定积分制的资源：不再受限额规则约束，用量页只展示提取次数
+POINTS_BASED_RESOURCES = {"163", "4399", "sauth"}
 ROLE_ADMIN = "admin"
 ROLE_STAFF = "staff"
 
@@ -339,23 +341,27 @@ class ControlService:
     def list_resource_user_usage(self, *, resource: str = "", query: str = "",
                                  page: int = 1, page_size: int = 20,
                                  now: datetime | None = None) -> dict:
-        """Aggregate each user's own rolling quota, with bounded SQL pagination."""
+        """
+        近 24 小时用户提取统计（积分制资源不再有个人限额框架）；
+        仍配置限额规则的资源（如 NFA）附带规则窗口内的额度状态。
+        """
         now = self._aware_utc(now or utc_now())
         rules = {item["resource"]: item for item in self.list_resource_limits()}
-        selected = [item for name, item in rules.items() if not resource or name == resource]
+        resources = [name for name in sorted(RESOURCE_NAMES) if not resource or name == resource]
         page_size = min(100, max(1, int(page_size)))
-        if not selected:
+        if not resources:
             return {"items": [], "total": 0, "page": 1, "pages": 1}
-        window_filter = or_(*[and_(
-            ResourceUsage.resource == item["resource"],
-            ResourceUsage.used_at >= now - timedelta(seconds=item["window_seconds"]),
-        ) for item in selected])
         grouped = select(
             ResourceUsage.resource, ResourceUsage.user_key,
-            func.count(ResourceUsage.id).label("used"),
-            func.min(ResourceUsage.used_at).label("oldest"),
+            func.count(ResourceUsage.id).label("used_day"),
+            func.sum(case((ResourceUsage.used_at >= now - timedelta(seconds=60), 1), else_=0)).label("c_minute"),
+            func.sum(case((ResourceUsage.used_at >= now - timedelta(seconds=3600), 1), else_=0)).label("c_hour"),
             func.max(ResourceUsage.used_at).label("latest"),
-        ).where(window_filter, ResourceUsage.used_at <= now)
+        ).where(
+            ResourceUsage.resource.in_(resources),
+            ResourceUsage.used_at >= now - timedelta(seconds=86400),
+            ResourceUsage.used_at <= now,
+        )
         if query:
             grouped = grouped.where(ResourceUsage.user_key.contains(query, autoescape=True))
         grouped = grouped.group_by(ResourceUsage.resource, ResourceUsage.user_key).subquery()
@@ -364,21 +370,62 @@ class ControlService:
             pages = max(1, (total + page_size - 1) // page_size)
             page = min(pages, max(1, int(page)))
             rows = session.execute(select(grouped).order_by(
-                grouped.c.used.desc(), grouped.c.resource, grouped.c.user_key,
+                grouped.c.used_day.desc(), grouped.c.resource, grouped.c.user_key,
             ).offset((page - 1) * page_size).limit(page_size)).mappings().all()
+
+            quota_map: dict[tuple[str, str], dict] = {}
+            rule_resources = [
+                item for name, item in rules.items()
+                if name in resources and name not in POINTS_BASED_RESOURCES
+            ]
+            if rule_resources:
+                quota_rows = session.execute(select(
+                    ResourceUsage.resource, ResourceUsage.user_key,
+                    func.count(ResourceUsage.id).label("used"),
+                    func.min(ResourceUsage.used_at).label("oldest"),
+                ).where(or_(*[and_(
+                    ResourceUsage.resource == item["resource"],
+                    ResourceUsage.used_at >= now - timedelta(seconds=item["window_seconds"]),
+                    ResourceUsage.used_at <= now,
+                ) for item in rule_resources])).group_by(
+                    ResourceUsage.resource, ResourceUsage.user_key
+                )).mappings().all()
+                for row in quota_rows:
+                    quota_map[(row["resource"], row["user_key"])] = {
+                        "used": int(row["used"]), "oldest": row["oldest"],
+                    }
+
         items = []
         for row in rows:
-            rule = rules[row["resource"]]
-            reset_at = self._aware_utc(row["oldest"]) + timedelta(seconds=rule["window_seconds"])
-            items.append({
-                "resource": row["resource"], "user_key": row["user_key"],
-                "used": int(row["used"]), "limit": rule["limit_count"],
-                "remaining": max(0, rule["limit_count"] - row["used"]),
-                "blocked": row["used"] >= rule["limit_count"],
-                "window_unit": rule["window_unit"],
-                "reset_after": max(0, int((reset_at - now).total_seconds())),
+            resource_name = row["resource"]
+            rule = rules.get(resource_name) or {}
+            quota = quota_map.get((resource_name, row["user_key"])) if resource_name not in POINTS_BASED_RESOURCES else None
+            item = {
+                "resource": resource_name, "user_key": row["user_key"],
+                "is_points": resource_name in POINTS_BASED_RESOURCES,
+                "counts": {
+                    "minute": int(row["c_minute"] or 0),
+                    "hour": int(row["c_hour"] or 0),
+                    "day": int(row["used_day"] or 0),
+                },
                 "latest": format_beijing_datetime(row["latest"]),
-            })
+            }
+            if quota and rule:
+                limit_count = int(rule.get("limit_count", 0) or 0)
+                reset_at = self._aware_utc(quota["oldest"]) + timedelta(seconds=int(rule.get("window_seconds", 0)))
+                item.update({
+                    "quota_used": quota["used"], "limit": limit_count,
+                    "remaining": max(0, limit_count - quota["used"]),
+                    "blocked": quota["used"] >= limit_count,
+                    "window_unit": rule.get("window_unit", ""),
+                    "reset_after": max(0, int((reset_at - now).total_seconds())),
+                })
+            else:
+                item.update({
+                    "quota_used": 0, "limit": 0, "remaining": 0,
+                    "blocked": False, "window_unit": "", "reset_after": 0,
+                })
+            items.append(item)
         return {"items": items, "total": total, "page": page, "pages": pages}
 
     def record_resource_usage(

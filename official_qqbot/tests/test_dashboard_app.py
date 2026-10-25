@@ -421,7 +421,8 @@ class DashboardAppTests(unittest.TestCase):
     def test_limits_dashboard_shows_totals_and_personal_quotas_separately(self):
         self._login()
         service = self.app.state.control_service
-        service.set_resource_limit("163", 3, "day", updated_by="admin")
+        service.set_resource_limit("nfa", 3, "day", updated_by="admin")
+        service.record_resource_usage("nfa", "user-a")
         service.record_resource_usage("163", "user-a")
         text = self.client.get("/dashboard/limits").text
         self.assertIn("资源用量总览", text)
@@ -429,6 +430,7 @@ class DashboardAppTests(unittest.TestCase):
         self.assertIn("积分规则", text)
         self.assertIn("积分榜", text)
         self.assertIn("近 24 小时", text)
+        self.assertIn("近 1 分钟", text)
         self.assertIn("不能相加", text)
         self.assertIn("1 / 3", text)
         self.assertIn("可继续获取", text)
@@ -438,14 +440,15 @@ class DashboardAppTests(unittest.TestCase):
     def test_limits_filters_are_server_rendered_and_escape_user_input(self):
         self._login()
         service = self.app.state.control_service
-        service.set_resource_limit("163", 1, "day")
-        service.set_resource_limit("4399", 1, "day")
-        service.record_resource_usage("163", "user-a")
-        service.record_resource_usage("4399", "user-b")
-        response = self.client.get("/dashboard/limits?resource=163&q=user-a")
+        service.set_resource_limit("nfa", 1, "day")
+        service.record_resource_usage("nfa", "user-a")
+        service.record_resource_usage("nfa", "user-b")
+        service.record_resource_usage("163", "user-b")
+        response = self.client.get("/dashboard/limits?resource=nfa&q=user-a")
         self.assertIn("user-a", response.text)
         self.assertNotIn("user-b", response.text)
         self.assertIn("已达限额", response.text)
+        self.assertIn("积分制", self.client.get("/dashboard/limits?resource=163").text)
         response = self.client.get('/dashboard/limits', params={"q": '<script>alert(1)</script>', "page": "bad"})
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('<script>alert(1)</script>', response.text)

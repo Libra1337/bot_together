@@ -94,24 +94,41 @@ def user_usage_table(result):
     rows = []
     for item in result["items"]:
         user = esc(item["user_key"])
-        limit, used = int(item["limit"]), int(item["used"])
-        status = "已达限额" if item["blocked"] else "可继续获取"
-        klass = " is-blocked" if item["blocked"] else ""
+        counts = item.get("counts", {})
+        if item.get("is_points"):
+            mode = (
+                f'<strong>{esc(item["resource"].upper())}</strong>'
+                f'<span class="cell-note">积分制 · {POINTS_COST.get(item["resource"], "按积分扣减")}</span>'
+            )
+            quota_cell = f'<span class="status-label">{esc(POINTS_COST.get(item["resource"], "按积分扣减"))}</span>'
+        else:
+            limit, used = int(item["limit"]), int(item["quota_used"])
+            status = "已达限额" if item["blocked"] else "可继续获取"
+            klass = " is-blocked" if item["blocked"] else ""
+            window_note = f'每{UNITS.get(item["window_unit"], esc(item["window_unit"]))}' if item["window_unit"] else ""
+            mode = (
+                f'<strong>{esc(item["resource"].upper())}</strong>'
+                f'<span class="cell-note">{esc(window_note)}</span>'
+            )
+            quota_cell = (
+                f'{used:,} / {limit:,}'
+                f'<span class="cell-note">{status} · 释放 {duration(item["reset_after"])}</span>'
+            )
         rows.append(f'''<tr>
           <td><code title="{user}">{user}</code></td>
-          <td><strong>{esc(item['resource'].upper())}</strong><span class="cell-note">每{UNITS.get(item['window_unit'], esc(item['window_unit']))}</span></td>
-          <td class="numeric"><div class="usage-meter"><span class="meter-caption">{used:,} / {limit:,}</span>
-          <progress value="{min(used, limit)}" max="{limit}" aria-label="{user} 已用 {used} 次，限额 {limit} 次"></progress></div></td>
-          <td class="numeric">{item['remaining']:,}</td>
-          <td><span class="status-label{klass}">{status}</span></td>
-          <td>{duration(item['reset_after'])}</td>
+          <td>{mode}</td>
+          <td class="numeric">{int(counts.get("minute", 0)):,}</td>
+          <td class="numeric">{int(counts.get("hour", 0)):,}</td>
+          <td class="numeric">{int(counts.get("day", 0)):,}</td>
+          <td>{quota_cell}</td>
           <td class="numeric">{esc(short_time(item['latest']))}</td>
         </tr>''')
     if not rows:
-        rows.append('<tr><td colspan="7" class="empty">当前筛选下暂无有效用量。<span class="cell-note">用户成功获取资源后，会在对应的限额周期内显示。</span></td></tr>')
-    return '''<div class="table-wrap"><table><caption class="sr-only">每位用户在当前滚动限额周期内的用量</caption>
-    <thead><tr><th scope="col">用户 OpenID</th><th scope="col">资源 / 周期</th><th scope="col" class="numeric">已用 / 限额</th>
-    <th scope="col" class="numeric">剩余次数</th><th scope="col">状态</th><th scope="col">下次释放</th><th scope="col" class="numeric">最近获取 · 北京时间</th></tr></thead>
+        rows.append('<tr><td colspan="7" class="empty">当前筛选下暂无有效用量。<span class="cell-note">用户成功提取资源后，这里会显示近 24 小时的使用统计。</span></td></tr>')
+    return '''<div class="table-wrap"><table><caption class="sr-only">每位用户近 24 小时的提取统计与额度状态</caption>
+    <thead><tr><th scope="col">用户 OpenID</th><th scope="col">资源</th><th scope="col" class="numeric">近 1 分钟</th>
+    <th scope="col" class="numeric">近 1 小时</th><th scope="col" class="numeric">近 24 小时</th>
+    <th scope="col">额度</th><th scope="col" class="numeric">最近获取 · 北京时间</th></tr></thead>
     <tbody>''' + ''.join(rows) + '</tbody></table></div>'
 
 
