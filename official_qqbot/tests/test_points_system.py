@@ -72,14 +72,14 @@ class GroupAddRewardTests(PointsFileSystemTestBase):
         }
 
     async def test_add_to_large_group_awards_25_points(self):
-        bot._identity_map["union-a"] = "union-a"
+        bot._identity_map["member-a"] = "union-a"
         with patch.object(
             bot, "fetch_group_member_count", new_callable=AsyncMock
         ) as fetch_count, patch.object(
             bot, "send_group_msg", new_callable=AsyncMock
         ):
             fetch_count.return_value = 42
-            await bot.handle_group_add_robot(self._group_event("group-a", "union-a"))
+            await bot.handle_group_add_robot(self._group_event("group-a", "member-a"))
 
         self.assertEqual(bot._sign_data["union-a"]["points"], 25)
         self.assertIn("group-a", bot._sign_data["union-a"]["rewarded_groups"])
@@ -96,7 +96,7 @@ class GroupAddRewardTests(PointsFileSystemTestBase):
         self.assertNotIn("union-a", bot._sign_data)
 
     async def test_daily_limit_blocks_after_ten_rewards(self):
-        bot._identity_map["union-a"] = "union-a"
+        bot._identity_map["member-a"] = "union-a"
         with patch.object(
             bot, "fetch_group_member_count", new_callable=AsyncMock
         ) as fetch_count, patch.object(
@@ -105,22 +105,22 @@ class GroupAddRewardTests(PointsFileSystemTestBase):
             fetch_count.return_value = 99
             for i in range(bot.GROUP_ADD_DAILY_LIMIT + 2):
                 await bot.handle_group_add_robot(
-                    self._group_event(f"group-{i}", "union-a")
+                    self._group_event(f"group-{i}", "member-a")
                 )
 
         expected = bot.GROUP_ADD_REWARD_POINTS * bot.GROUP_ADD_DAILY_LIMIT
         self.assertEqual(bot._sign_data["union-a"]["points"], expected)
 
     async def test_same_group_rewarded_only_once(self):
-        bot._identity_map["union-a"] = "union-a"
+        bot._identity_map["member-a"] = "union-a"
         with patch.object(
             bot, "fetch_group_member_count", new_callable=AsyncMock
         ) as fetch_count, patch.object(
             bot, "send_group_msg", new_callable=AsyncMock
         ):
             fetch_count.return_value = 99
-            await bot.handle_group_add_robot(self._group_event("group-a", "union-a"))
-            await bot.handle_group_add_robot(self._group_event("group-a", "union-a"))
+            await bot.handle_group_add_robot(self._group_event("group-a", "member-a"))
+            await bot.handle_group_add_robot(self._group_event("group-a", "member-a"))
 
         self.assertEqual(bot._sign_data["union-a"]["points"], 25)
 
@@ -250,6 +250,108 @@ class RateLimitTests(unittest.TestCase):
             )
         self.assertFalse(blocked)
         self.assertEqual(used, 0)
+
+
+class QQBindTests(PointsFileSystemTestBase):
+    def setUp(self):
+        super().setUp()
+        self.old_qq_binds = bot._qq_binds
+        bot._qq_binds = {}
+        self.old_qq_file = bot.QQ_BIND_FILE
+        bot.QQ_BIND_FILE = os.path.join(self.tmp.name, "qq_binds.json")
+
+    def tearDown(self):
+        bot._qq_binds = self.old_qq_binds
+        bot.QQ_BIND_FILE = self.old_qq_file
+        super().tearDown()
+
+    async def test_bind_merges_balance_into_qq_account(self):
+        bot._sign_data["member-a"] = {"points": 80, "streak": 2, "last": ""}
+        ok, message = bot.bind_qq_account("member-a", "123456789")
+        self.assertTrue(ok)
+        self.assertEqual(bot._sign_data["QQ123456789"]["points"], 80)
+        self.assertEqual(bot._sign_data["member-a"].get("merged_into"), "QQ123456789")
+        self.assertEqual(bot._account_key("member-a"), "QQ123456789")
+        self.assertIn("123456789", message)
+
+    async def test_same_person_binds_from_second_group(self):
+        bot._sign_data["member-a"] = {"points": 80, "streak": 2, "last": ""}
+        bot.bind_qq_account("member-a", "123456789")
+        bot._sign_data["member-b"] = {"points": 45, "streak": 1, "last": ""}
+        ok, message = bot.bind_qq_account("member-b", "123456789")
+        self.assertTrue(ok)
+        self.assertEqual(bot._sign_data["QQ123456789"]["points"], 125)
+
+    async def test_claimed_qq_accepts_same_person_second_scenario(self):
+        bot.bind_qq_account("member-a", "123456789")
+        bot._sign_data["member-b"] = {"points": 10, "streak": 0, "last": ""}
+        ok, message = bot.bind_qq_account("member-b", "123456789")
+        self.assertTrue(ok)
+        self.assertEqual(bot._sign_data["QQ123456789"]["points"], 10)
+        self.assertEqual(bot._account_key("member-b"), "QQ123456789")
+        self.assertEqual(bot._account_key("member-a"), "QQ123456789")
+
+    def _group_event(self, member="member-a", union="union-a", group="group-a"):
+        data = {
+            "id": "msg-1",
+            "group_openid": group,
+            "author": {
+                "member_openid": member,
+                "union_openid": union,
+                "bot": False,
+            },
+            "content": "/help",
+        }
+        return adapt_message_event(GROUP_AT_MESSAGE_CREATE, data, set())
+
+    async def test_sign_in_after_bind_uses_qq_account(self):
+        bot._sign_data["member-a"] = {"points": 10, "streak": 0, "last": ""}
+        bot.bind_qq_account("member-a", "123456789")
+        bot.do_sign_in(bot._account_key("member-a"))
+        self.assertEqual(bot._sign_data["QQ123456789"]["points"], 60)
+
+    async def test_identity_learning_propagates_qq_bind(self):
+        bot._qq_binds["member-a"] = "123456789"
+        event = self._group_event()
+        bot.resolve_message_identity(event)
+        self.assertEqual(bot._account_key(event.limit_user_id), "QQ123456789")
+
+
+class BindQQCommandTests(PointsFileSystemTestBase):
+    def setUp(self):
+        super().setUp()
+        self.old_qq_binds = bot._qq_binds
+        self.old_qq_file = bot.QQ_BIND_FILE
+        bot._qq_binds = {}
+        bot.QQ_BIND_FILE = os.path.join(self.tmp.name, "qq_binds.json")
+        self.ctx = {
+            "type": "c2c",
+            "user_openid": "member-a",
+            "msg_id": "msg-bindqq",
+            "limit_user_id": "member-a",
+        }
+
+    def tearDown(self):
+        bot._qq_binds = self.old_qq_binds
+        bot.QQ_BIND_FILE = self.old_qq_file
+        super().tearDown()
+
+    async def test_bindqq_command_merges_points(self):
+        bot._sign_data["member-a"] = {"points": 30, "streak": 0, "last": ""}
+        with patch.object(bot, "reply_plain", new_callable=AsyncMock) as reply_plain:
+            handled = await bot.handle_command(self.ctx, "/bindqq 10001")
+
+        self.assertTrue(handled)
+        self.assertIn("QQ 10001", reply_plain.await_args.args[1])
+        self.assertEqual(bot._sign_data["QQ10001"]["points"], 30)
+
+    async def test_bindqq_invalid_input_shows_usage(self):
+        with patch.object(bot, "reply", new_callable=AsyncMock) as reply:
+            handled = await bot.handle_command(self.ctx, "/bindqq abc")
+
+        self.assertTrue(handled)
+        self.assertIn("/bindqq 你的QQ号", reply.await_args.args[1])
+        self.assertEqual(bot._qq_binds, {})
 
 
 class SauthRateGateTests(PointsFileSystemTestBase):

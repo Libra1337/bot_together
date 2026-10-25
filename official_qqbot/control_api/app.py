@@ -986,6 +986,7 @@ POINTS_RULES = (
     ("提取 4399 小号", "-2 积分/次，不限次数"),
     ("提取 sauth", "-5 积分/次，1 分钟最多 5 次"),
     ("提取 163 小号", "-50 积分/次，1 小时最多 1 次"),
+    ("/bindqq QQ号", "统一积分账户：换群/私聊共用一个余额，绑定即合并"),
 )
 _POINTS_BASED_RESOURCES = {"4399", "sauth", "163"}
 
@@ -997,6 +998,12 @@ def _read_sign_data() -> dict:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _account_label(key: str) -> str:
+    if key.startswith("QQ") and key[2:].isdigit():
+        return f"QQ {key[2:]}"
+    return f"{key[:16]}…"
 
 
 def _points_panels() -> str:
@@ -1015,7 +1022,7 @@ def _points_panels() -> str:
     )[:20]
     if users:
         rows = "".join(
-            f'<tr><td><code>{html.escape(key[:16])}…</code></td>'
+            f'<tr><td><code>{html.escape(_account_label(key))}</code></td>'
             f'<td class="numeric">{int(info.get("points", 0) or 0):,}</td>'
             f'<td class="numeric">{int(info.get("streak", 0) or 0)}</td>'
             f'<td>{html.escape(str(info.get("last", "")))}</td></tr>'

@@ -902,7 +902,8 @@ def _points_shortage_text(cost: int, balance: int) -> str:
     return (
         f"积分不足喵~提取该资源需要 {cost} 积分，你当前有 {balance} 积分\n"
         f"每日签到 +{SIGN_IN_POINTS}；邀请我进 10 人以上的群 +{GROUP_ADD_REWARD_POINTS}"
-        f"（每天最多 {GROUP_ADD_DAILY_LIMIT} 次）"
+        f"（每天最多 {GROUP_ADD_DAILY_LIMIT} 次）\n"
+        f"发送 /bindqq 你的QQ号，所有群的积分自动合并成一个账户喵~"
     )
 
 
@@ -951,6 +952,10 @@ def points_balance_text(user_openid) -> str:
     user = _sign_data.get(user_openid) or {}
     used_today = int(user.get("group_add_count", 0) or 0) \
         if user.get("group_add_last") == _today_str() else 0
+    qq_hint = (
+        "\n━━━ 统一账户 ━━━\n发送 /bindqq 你的QQ号，换群/私聊积分合并成一个账户"
+        if not user_openid.startswith("QQ") else ""
+    )
     return (
         f"当前积分：{user.get('points', 0)}\n"
         f"━━━ 积分规则 ━━━\n"
@@ -960,6 +965,7 @@ def points_balance_text(user_openid) -> str:
         f"提取 4399 小号 -{EXTRACT_POINTS_COST['4399']} 积分（不限次）\n"
         f"提取 sauth -{EXTRACT_POINTS_COST['sauth']} 积分（1 分钟最多 {SAUTH_RATE_LIMIT} 次）\n"
         f"提取 163 小号 -{EXTRACT_POINTS_COST['163']} 积分（1 小时最多 1 次）"
+        f"{qq_hint}"
     )
 
 
@@ -1012,6 +1018,11 @@ def _learn_identity(scenario_openid: str, union_openid: str) -> list[str]:
     if _identity_map.get(scenario_openid) == union_openid:
         return []
     _identity_map[scenario_openid] = union_openid
+    # QQ 绑定跟随本人迁移到 union 键（平台开始下发 union 后不丢账户）
+    qq = _qq_binds.get(scenario_openid)
+    if qq and not _qq_binds.get(union_openid):
+        _qq_binds[union_openid] = qq
+        _save_qq_binds()
     _save_identity(_identity_map)
     _log.info(f"[身份] {scenario_openid[:8]}... -> union {union_openid[:8]}...")
     return [scenario_openid]
@@ -1054,18 +1065,17 @@ def _queue_pending_reward(group_openid: str, member_openid: str) -> None:
 
 
 def _flush_pending_rewards(group_openid: str, member_openid: str, union_openid: str) -> int:
-    """该成员在本群首次发言（身份已知）时，把挂账的拉群奖励入账，返回入账积分"""
+    """该成员在本群首次发言（身份可知）时，把挂账的拉群奖励入账，返回入账积分"""
     pending = _pending_rewards()
     remaining, awarded = [], 0
+    account = _account_key(union_openid or member_openid)
     for item in pending:
         if (
             isinstance(item, dict)
             and item.get("group") == group_openid
             and item.get("member") == member_openid
         ):
-            reason, gained = award_group_add_points(
-                union_openid, str(item.get("group", ""))
-            )
+            reason, gained = award_group_add_points(account, str(item.get("group", "")))
             if reason == "ok":
                 awarded += int(gained or 0)
         else:
@@ -1086,20 +1096,104 @@ def resolve_message_identity(event) -> int:
     """
     scenario_openid = event.user_openid
     union_openid = event.limit_user_id
-    if not scenario_openid or not union_openid or scenario_openid == union_openid:
-        return 0
-    learned = _learn_identity(scenario_openid, union_openid)
-    if learned:
-        _merge_legacy_points(union_openid, learned)
+    if scenario_openid and union_openid and scenario_openid != union_openid:
+        learned = _learn_identity(scenario_openid, union_openid)
+        if learned:
+            _merge_legacy_points(union_openid, learned)
     awarded = 0
     if getattr(event, "group_openid", ""):
-        awarded = _flush_pending_rewards(event.group_openid, scenario_openid, union_openid)
+        awarded = _flush_pending_rewards(
+            event.group_openid, scenario_openid or union_openid, union_openid
+        )
         if awarded:
-            balance = get_user_points(union_openid)
+            balance = get_user_points(_account_key(union_openid))
             _log.info(
-                f"[拉群奖励] 挂账入账 +{awarded} union={union_openid[:8]}... balance={balance}"
+                f"[拉群奖励] 挂账入账 +{awarded} account={_account_key(union_openid)[:12]}... balance={balance}"
             )
     return awarded
+
+
+# ====== QQ 号统一积分账户（平台未下发 union_openid 时的跨场景归一） ======
+QQ_BIND_FILE = os.path.join(_BOT_DIR, "data", "qq_binds.json")
+
+
+def _load_qq_binds() -> dict:
+    try:
+        if os.path.exists(QQ_BIND_FILE):
+            with open(QQ_BIND_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_qq_binds() -> None:
+    try:
+        os.makedirs(os.path.dirname(QQ_BIND_FILE), exist_ok=True)
+        with open(QQ_BIND_FILE, "w", encoding="utf-8") as f:
+            json.dump(_qq_binds, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _log.warning(f"[QQ绑定] 保存失败: {e}")
+
+
+_qq_binds: dict = _load_qq_binds()
+
+
+def _account_key(limit_user_id: str) -> str:
+    """统一积分账户键：QQ 绑定 > union 映射 > 场景 openid"""
+    qq = _qq_binds.get(limit_user_id)
+    if qq:
+        return f"QQ{qq}"
+    return _identity_map.get(limit_user_id) or limit_user_id
+
+
+def _account_label(key: str) -> str:
+    if key.startswith("QQ") and key[2:].isdigit():
+        return f"QQ {key[2:]}"
+    return f"{key[:8]}..."
+
+
+def bind_qq_account(limit_user_id: str, qq: str) -> tuple[bool, str]:
+    """
+    把当前场景账户并入 QQ 号统一积分账户（余额合并）。
+    同一 QQ 允许从多个场景 openid 绑定：同一人换群/私聊共用一个账户。
+    """
+    qq_key = f"QQ{qq}"
+    first_claim = qq_key not in _sign_data
+    merged = 0
+    if _qq_binds.get(limit_user_id) != qq:
+        current_key = _account_key(limit_user_id)
+        legacy = _sign_data.get(current_key)
+        if isinstance(legacy, dict) and not legacy.get("merged_into"):
+            account = _sign_data.setdefault(
+                qq_key, {"points": 0, "streak": 0, "last": ""}
+            )
+            merged = int(legacy.get("points", 0) or 0)
+            account["points"] = int(account.get("points", 0) or 0) + merged
+            account["streak"] = max(
+                int(account.get("streak", 0) or 0), int(legacy.get("streak", 0) or 0)
+            )
+            account["last"] = max(str(account.get("last", "")), str(legacy.get("last", "")))
+            legacy["points"] = 0
+            legacy["merged_into"] = qq_key
+        _qq_binds[limit_user_id] = qq
+        _save_qq_binds()
+        _save_sign(_sign_data)
+        _log.info(
+            f"[QQ绑定] {limit_user_id[:8]}... -> QQ{qq} 合并积分 {merged}"
+            + ("（首个绑定）" if first_claim else "（该 QQ 已有账户，本次为并入）")
+        )
+
+    balance = get_user_points(qq_key)
+    message = (
+        f"QQ 绑定成功喵~积分账户已统一为 QQ {qq}\n"
+        + (f"原账户 {merged} 积分已并入\n" if merged else "")
+        + f"当前积分：{balance}\n"
+        f"换群/私聊都是同一个账户；在其他群发一次 /bindqq {qq} 即可把那个群也并进来~"
+    )
+    return True, message
 
 
 # ====== Access Token ======
@@ -1571,6 +1665,7 @@ async def handle_command(ctx, content):
     lower = content.lower().strip()
     user_id = ctx["user_openid"]
     limit_user_id = ctx.get("limit_user_id") or user_id
+    account_id = _account_key(limit_user_id)
 
     if lower in ("/mdtest", "mdtest"):
         await reply_markdown_card(
@@ -1601,6 +1696,7 @@ async def handle_command(ctx, content):
                 "━━━ 日常功能 ━━━\n"
                 "签到 / 打卡 — 每日签到 +50 积分\n"
                 "积分 — 查询余额与积分规则\n"
+                "/bindqq QQ号 — 统一积分账户（换群不丢积分）\n"
                 "邀请我进群 — 10 人以上群 +25 积分（每日最多 10 次）\n"
                 "排行榜 — 查看积分排名\n"
                 "运势 / 抽签 — 查看今日运势\n"
@@ -1637,6 +1733,7 @@ async def handle_command(ctx, content):
                 "/quit — 退出登陆\n"
                 "/admin — 管理面板\n"
                 "/ban openid — 封禁用户\n"
+                "/unbindqq openid — 解绑QQ统一账户\n"
                 "/unban openid — 解封用户\n"
                 "/addstaff openid — 添加 Staff\n"
                 "/deletestaff openid — 移除 Staff\n"
@@ -1823,6 +1920,39 @@ async def handle_command(ctx, content):
         await reply_plain(ctx, f"你的 openid：\n{user_id}\n绑定邮箱：{email}")
         return True
 
+    # ===== /bindqq QQ号：统一积分账户 =====
+    if re.match(r"^(?:/bindqq|绑定积分QQ|绑定积分qq|绑定QQ号|绑定qq号)(?:\s|$)", content):
+        bindqq_match = re.match(
+            r"^(?:/bindqq|绑定积分QQ|绑定积分qq|绑定QQ号|绑定qq号)\s+(\d{5,11})$", content
+        )
+        if bindqq_match:
+            ok, message = bind_qq_account(limit_user_id, bindqq_match.group(1))
+            await reply_plain(ctx, message)
+        else:
+            await reply(
+                ctx,
+                "发送 /bindqq 你的QQ号，把所有群的积分合并成一个账户喵~\n"
+                "例如：/bindqq 123456789\n换群、私聊积分都算同一个账户！",
+            )
+        return True
+
+    # ===== /unbindqq（管理员解绑统一账户） =====
+    if content.startswith("/unbindqq "):
+        if not _is_admin(user_id):
+            await reply(ctx, "仅 Admin 可解绑 QQ 统一账户喵~")
+            return True
+        target = content[11:].strip()
+        if _qq_binds.pop(target, None) is None:
+            await reply(ctx, "该账号没有绑定 QQ 统一账户喵~")
+            return True
+        _save_qq_binds()
+        await reply_plain(
+            ctx,
+            f"已解绑 {target[:12]}... 的 QQ 账户绑定喵~（余额留在 QQ 账户中不变）",
+        )
+        _log.info(f"[QQ绑定] 管理员解绑 {target[:12]}...")
+        return True
+
     # ===== 绑定邮箱 =====
     bind_match = re.match(r"^(?:/bind|绑定邮箱|/绑定邮箱|绑定QQ号|绑定qq号|/bindqq)\s+(\S+)$", content, re.IGNORECASE)
     if bind_match:
@@ -1860,15 +1990,15 @@ async def handle_command(ctx, content):
             await reply(ctx, "你还没有绑定邮箱喵~")
         return True
 
-    # 签到（积分记到 union 账户，换群/私聊都是同一个账户）
+    # 签到（积分记到统一账户：QQ 绑定 > union > 场景 openid）
     if lower in ("签到", "打卡"):
-        result = do_sign_in(limit_user_id)
+        result = do_sign_in(account_id)
         await reply(ctx, result)
         return True
 
     # 积分查询
     if lower in ("积分", "余额", "我的积分", "查积分", "points", "/points"):
-        await reply(ctx, points_balance_text(limit_user_id))
+        await reply(ctx, points_balance_text(account_id))
         return True
 
     # 运势
@@ -1943,7 +2073,7 @@ async def handle_command(ctx, content):
             return True
 
         cost = EXTRACT_POINTS_COST["4399"]
-        balance = get_user_points(limit_user_id)
+        balance = get_user_points(account_id)
         if balance < cost:
             await reply(ctx, _points_shortage_text(cost, balance))
             return True
@@ -1954,13 +2084,13 @@ async def handle_command(ctx, content):
 
         success, result = await sauth.get_4399_credentials()
         if success:
-            spent, remaining = try_spend_points(limit_user_id, cost)
+            spent, remaining = try_spend_points(account_id, cost)
             if not spent:
                 _log.warning(
-                    f"[4399] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                    f"[4399] 积分并发扣减失败 account={_account_label(account_id)} balance={remaining}"
                 )
-            _shared_cd.record_rate_usage("4399", limit_user_id)
-            _state_backend.record_resource_usage("4399", limit_user_id, ctx=ctx)
+            _shared_cd.record_rate_usage("4399", account_id)
+            _state_backend.record_resource_usage("4399", account_id, ctx=ctx)
             quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             result += "\n爱来自Miracle小号网站喵~"
             await _send_resource_result(
@@ -1984,7 +2114,7 @@ async def handle_command(ctx, content):
             return True
 
         over, used, retry_after = _shared_cd.check_rate_limit(
-            "sauth", limit_user_id, SAUTH_RATE_LIMIT, SAUTH_RATE_WINDOW
+            "sauth", account_id, SAUTH_RATE_LIMIT, SAUTH_RATE_WINDOW
         )
         if over:
             await reply(
@@ -1995,7 +2125,7 @@ async def handle_command(ctx, content):
             return True
 
         cost = EXTRACT_POINTS_COST["sauth"]
-        balance = get_user_points(limit_user_id)
+        balance = get_user_points(account_id)
         if balance < cost:
             await reply(ctx, _points_shortage_text(cost, balance))
             return True
@@ -2006,13 +2136,13 @@ async def handle_command(ctx, content):
 
         success, result = await sauth.get_sauth()
         if success:
-            spent, remaining = try_spend_points(limit_user_id, cost)
+            spent, remaining = try_spend_points(account_id, cost)
             if not spent:
                 _log.warning(
-                    f"[sauth] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                    f"[sauth] 积分并发扣减失败 account={_account_label(account_id)} balance={remaining}"
                 )
-            _shared_cd.record_rate_usage("sauth", limit_user_id)
-            _state_backend.record_resource_usage("sauth", limit_user_id, ctx=ctx)
+            _shared_cd.record_rate_usage("sauth", account_id)
+            _state_backend.record_resource_usage("sauth", account_id, ctx=ctx)
             quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             await _send_resource_result(
                 ctx,
@@ -2034,13 +2164,13 @@ async def handle_command(ctx, content):
         if _resource_request_requires_email(ctx) and not await _require_bound_email(ctx, user_id):
             return True
 
-        banned, bh, bm = _shared_cd.is_banned("163", limit_user_id)
+        banned, bh, bm = _shared_cd.is_banned("163", account_id)
         if banned:
             await reply(
                 ctx, f"您因疑似偷卡已被临时封禁，剩余 {bh}小时{bm}分钟 后解封喵~"
             )
             return True
-        in_cd, remain = _shared_cd.check_cooldown("163", limit_user_id, SAUTH_163_COOLDOWN)
+        in_cd, remain = _shared_cd.check_cooldown("163", account_id, SAUTH_163_COOLDOWN)
         if in_cd:
             await reply(
                 ctx,
@@ -2049,7 +2179,7 @@ async def handle_command(ctx, content):
             return True
 
         cost = EXTRACT_POINTS_COST["163"]
-        balance = get_user_points(limit_user_id)
+        balance = get_user_points(account_id)
         if balance < cost:
             await reply(ctx, _points_shortage_text(cost, balance))
             return True
@@ -2060,14 +2190,14 @@ async def handle_command(ctx, content):
 
         success, result_163 = await sauth.get_163_credentials()
         if success:
-            spent, remaining = try_spend_points(limit_user_id, cost)
+            spent, remaining = try_spend_points(account_id, cost)
             if not spent:
                 _log.warning(
-                    f"[163] 积分并发扣减失败 user={limit_user_id[:8]}... balance={remaining}"
+                    f"[163] 积分并发扣减失败 account={_account_label(account_id)} balance={remaining}"
                 )
-            _shared_cd.record_usage("163", limit_user_id)
-            _shared_cd.record_rate_usage("163", limit_user_id)
-            _state_backend.record_resource_usage("163", limit_user_id, ctx=ctx)
+            _shared_cd.record_usage("163", account_id)
+            _shared_cd.record_rate_usage("163", account_id)
+            _state_backend.record_resource_usage("163", account_id, ctx=ctx)
             quota_text = f"已消耗积分：{cost}\n剩余积分：{remaining}"
             await _send_resource_result(
                 ctx,
@@ -2183,8 +2313,9 @@ async def handle_command(ctx, content):
         lines = ["签到排行榜 TOP10 喵~", "━━━━━━━━━━━━━━"]
         for i, (uid, info) in enumerate(sorted_users, 1):
             medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"{i}."
+            label = uid if uid.startswith("QQ") and uid[2:].isdigit() else f"{uid[:8]}..."
             lines.append(
-                f"{medal} {uid[:8]}... | {info.get('points', 0)}分 | 连签{info.get('streak', 0)}天"
+                f"{medal} {label} | {info.get('points', 0)}分 | 连签{info.get('streak', 0)}天"
             )
         lines.append("━━━━━━━━━━━━━━")
         await reply(ctx, "\n".join(lines))
@@ -2714,8 +2845,8 @@ async def handle_group_add_robot(data: dict) -> None:
         )
         return
 
-    union_openid = str(_identity_map.get(operator, "") or "")
-    if not union_openid:
+    account = _account_key(operator)
+    if account == operator:
         # 还不知道邀请者的统一身份：挂账，等他在本群发言后自动入账
         _queue_pending_reward(group_openid, operator)
         await send_group_msg(
@@ -2729,12 +2860,12 @@ async def handle_group_add_robot(data: dict) -> None:
         )
         return
 
-    reason, gained = award_group_add_points(union_openid, group_openid)
+    reason, gained = award_group_add_points(account, group_openid)
     if reason == "ok":
-        balance = get_user_points(union_openid)
+        balance = get_user_points(account)
         _log.info(
             f"[拉群奖励] +{gained} group={group_openid[:8]}... "
-            f"union={union_openid[:8]}... members={member_count} balance={balance}"
+            f"account={_account_label(account)} members={member_count} balance={balance}"
         )
         await send_group_msg(
             group_openid,
@@ -2746,10 +2877,10 @@ async def handle_group_add_robot(data: dict) -> None:
             str(data.get("id", "") or ""),
         )
     elif reason == "daily_limit":
-        _log.info(f"[拉群奖励] 当日奖励次数已用尽 union={union_openid[:8]}...")
+        _log.info(f"[拉群奖励] 当日奖励次数已用尽 account={_account_label(account)}")
     elif reason == "duplicate_group":
         _log.info(
-            f"[拉群奖励] 该群已奖励过 union={union_openid[:8]}... group={group_openid[:8]}..."
+            f"[拉群奖励] 该群已奖励过 account={_account_label(account)} group={group_openid[:8]}..."
         )
 
 
