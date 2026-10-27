@@ -138,6 +138,45 @@ class GroupAddRewardTests(PointsFileSystemTestBase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["member"], "member-a")
 
+    async def test_repeated_add_only_queues_once(self):
+        with patch.object(
+            bot, "fetch_group_member_count", new_callable=AsyncMock
+        ) as fetch_count, patch.object(
+            bot, "send_group_msg", new_callable=AsyncMock
+        ):
+            fetch_count.return_value = 99
+            for _ in range(3):
+                await bot.handle_group_add_robot(self._group_event("group-a", "member-a"))
+
+        self.assertEqual(len(bot._identity_map["_pending"]), 1)
+
+
+class PendingNoticeTests(PointsFileSystemTestBase):
+    async def test_group_message_triggers_one_time_notice(self):
+        bot._identity_map["_pending"] = [
+            {"group": "group-a", "member": "member-b", "points": 25, "ts": 1, "notified": False}
+        ]
+        with patch.object(bot, "send_group_msg", new_callable=AsyncMock) as send_msg:
+            send_msg.return_value = True
+            await bot.notify_pending_group_reward("group-a", "msg-9")
+
+        send_msg.assert_awaited_once()
+        self.assertIn("邀请奖励待领取", send_msg.await_args.args[1])
+        self.assertTrue(bot._identity_map["_pending"][0]["notified"])
+
+        with patch.object(bot, "send_group_msg", new_callable=AsyncMock) as send_msg:
+            await bot.notify_pending_group_reward("group-a", "msg-10")
+        send_msg.assert_not_awaited()
+
+    async def test_notice_failure_retries_next_message(self):
+        bot._identity_map["_pending"] = [
+            {"group": "group-a", "member": "member-b", "points": 25, "ts": 1, "notified": False}
+        ]
+        with patch.object(bot, "send_group_msg", new_callable=AsyncMock) as send_msg:
+            send_msg.return_value = False
+            await bot.notify_pending_group_reward("group-a", "msg-9")
+        self.assertFalse(bot._identity_map["_pending"][0]["notified"])
+
 
 class IdentityResolveTests(PointsFileSystemTestBase):
     def _group_event(self, member="member-a", union="union-a", group="group-a"):

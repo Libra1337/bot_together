@@ -961,7 +961,7 @@ def points_balance_text(user_openid) -> str:
         f"━━━ 积分规则 ━━━\n"
         f"签到 +{SIGN_IN_POINTS}/天\n"
         f"邀请我进 10 人以上群 +{GROUP_ADD_REWARD_POINTS}"
-        f"（今日拉群奖励 {used_today}/{GROUP_ADD_DAILY_LIMIT} 次）\n"
+        f"（今日 {used_today}/{GROUP_ADD_DAILY_LIMIT} 次，拉群后在群里 @我 领取）\n"
         f"提取 4399 小号 -{EXTRACT_POINTS_COST['4399']} 积分（不限次）\n"
         f"提取 sauth -{EXTRACT_POINTS_COST['sauth']} 积分（1 分钟最多 {SAUTH_RATE_LIMIT} 次）\n"
         f"提取 163 小号 -{EXTRACT_POINTS_COST['163']} 积分（1 小时最多 1 次）"
@@ -1048,20 +1048,61 @@ def _merge_legacy_points(union_openid: str, openids: list[str]) -> None:
 
 
 def _queue_pending_reward(group_openid: str, member_openid: str) -> None:
-    """拉群时还不知道操作者的 union：先挂账，等他在群里发言后入账"""
+    """拉群时还不知道操作者的 union：先挂账，等他在群里 @我 后入账"""
     pending = _pending_rewards()
-    pending.append(
-        {
-            "group": group_openid,
-            "member": member_openid,
-            "points": GROUP_ADD_REWARD_POINTS,
-            "ts": int(_time_mod.time()),
-        }
+    exists = any(
+        isinstance(item, dict)
+        and item.get("group") == group_openid
+        and item.get("member") == member_openid
+        for item in pending
     )
-    _save_identity(_identity_map)
+    if not exists:
+        pending.append(
+            {
+                "group": group_openid,
+                "member": member_openid,
+                "points": GROUP_ADD_REWARD_POINTS,
+                "ts": int(_time_mod.time()),
+                "notified": False,
+            }
+        )
+        _save_identity(_identity_map)
     _log.info(
         f"[拉群奖励] 待入账 group={group_openid[:8]}... op={member_openid[:8]}..."
     )
+
+
+async def notify_pending_group_reward(group_openid: str, msg_id: str) -> None:
+    """
+    群里有人 @我 时：若该群还有未通知的挂账奖励，补发一条领取指引。
+    被拉群瞬间机器人无法主动发言（主动消息无权限），只能借被动回复传达。
+    """
+    pending = _pending_rewards()
+    unnotified = [
+        item
+        for item in pending
+        if isinstance(item, dict)
+        and item.get("group") == group_openid
+        and not item.get("notified")
+    ]
+    if not unnotified:
+        return
+    ok = await send_group_msg(
+        group_openid,
+        (
+            f"有邀请奖励待领取喵~刚才拉我进群的邀请者，"
+            f"在群里 @我 或发送「签到」即可激活 +{GROUP_ADD_REWARD_POINTS} 积分到账\n"
+            f"（要求群人数 ≥{GROUP_ADD_MIN_MEMBERS}，每人每天最多 {GROUP_ADD_DAILY_LIMIT} 次）"
+        ),
+        msg_id,
+    )
+    if ok:
+        for item in unnotified:
+            item["notified"] = True
+        _save_identity(_identity_map)
+        _log.info(
+            f"[拉群奖励] 已补发领取指引 group={group_openid[:8]}... 条数={len(unnotified)}"
+        )
 
 
 def _flush_pending_rewards(group_openid: str, member_openid: str, union_openid: str) -> int:
@@ -1698,7 +1739,7 @@ async def handle_command(ctx, content):
                 "签到 / 打卡 — 每日签到 +50 积分\n"
                 "积分 — 查询余额与积分规则\n"
                 "/bindqq QQ号 — 统一积分账户（换群不丢积分）\n"
-                "邀请我进群 — 10 人以上群 +25 积分（每日最多 10 次）\n"
+                "邀请我进群 — 10 人以上群 +25 积分（每日 10 次，拉群后在群里 @我 领取）\n"
                 "排行榜 — 查看积分排名\n"
                 "运势 / 抽签 — 查看今日运势\n"
                 "今日人品 — 每日人品值\n"
@@ -2774,8 +2815,10 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
     if awarded:
         await reply(
             event.to_ctx(),
-            f"拉群奖励 +{awarded} 积分已到账喵~当前积分：{get_user_points(event.limit_user_id)}",
+            f"拉群奖励 +{awarded} 积分已到账喵~当前积分：{get_user_points(_account_key(event.limit_user_id))}",
         )
+    if event.msg_id:
+        await notify_pending_group_reward(event.group_openid, event.msg_id)
     await process_message(event.to_ctx(), event.content)
 
 
@@ -2853,8 +2896,8 @@ async def handle_group_add_robot(data: dict) -> None:
         await send_group_msg(
             group_openid,
             (
-                f"感谢把我拉进群喵~邀请奖励 {GROUP_ADD_REWARD_POINTS} 积分"
-                f"将在邀请者于群内发言后到账~\n"
+                f"感谢把我拉进群喵~邀请者 @我 或发送「签到」"
+                f"即可领取 +{GROUP_ADD_REWARD_POINTS} 积分~\n"
                 f"（发送「积分」可查余额，「签到」每天 +{SIGN_IN_POINTS}）"
             ),
             str(data.get("id", "") or ""),
