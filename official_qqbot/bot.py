@@ -11,6 +11,7 @@ import asyncio
 import logging
 import math
 import re
+from dataclasses import replace as dataclasses_replace
 import random
 import time as _time_mod
 import yaml
@@ -2788,6 +2789,27 @@ async def process_message(ctx, content):
 
 
 # ====== 事件处理 ======
+_BOT_MENTION_RE = re.compile(r"^\s*<@!?([0-9A-Za-z]{4,32})>\s*")
+
+
+def _split_full_message_at_bot(content: str) -> tuple[bool, str]:
+    """
+    全量消息开头的 @机器人 前缀识别：机器人以数字 appid 被 @，
+    群成员是 32 位十六进制 openid，据此区分 @我 和 @别人。
+    返回 (是否@了机器人, 去掉前缀后的内容)
+    """
+    text = str(content or "")
+    match = _BOT_MENTION_RE.match(text)
+    if not match:
+        return False, text
+    token = match.group(1)
+    rest = text[match.end():].strip()
+    if token == str(APP_ID) or (token.isdigit() and rest.startswith("/")):
+        return True, rest
+    _log.debug(f"[全量@识别] 非机器人前缀 token={token[:8]}... rest={rest[:20]}")
+    return False, text
+
+
 async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
     event = adapt_message_event(event_type, data, FULL_MESSAGE_GROUP_IDS)
     if not event:
@@ -2795,6 +2817,13 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
             f"[群消息忽略] event={event_type} group={data.get('group_openid', '')}"
         )
         return
+
+    # 全量模式下平台不再下发 GROUP_AT 事件，@机器人的消息
+    # 以 GROUP_MESSAGE_CREATE 到达且内容带 <@id> 前缀：识别并按@消息处理
+    if event.is_full_message and not event.is_at:
+        at_bot, stripped = _split_full_message_at_bot(event.content)
+        if at_bot:
+            event = dataclasses_replace(event, content=stripped, is_at=True)
 
     # 身份学习与拉群奖励挂账处理先于闲聊过滤：
     # 开启全量消息后，邀请者在群里随便说一句话即可激活奖励到账

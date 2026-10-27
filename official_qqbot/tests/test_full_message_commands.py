@@ -45,6 +45,37 @@ class FullMessageCommandTests(unittest.IsolatedAsyncioTestCase):
                 process.assert_not_awaited()
         self.assertFalse(bot._recent_group_msg_ids)
 
+    async def test_full_message_mentioning_bot_behaves_like_at_event(self):
+        cases = [
+            ("<@1903707124> /help", "/help"),
+            ("<@!1903707124> 签到", "签到"),
+        ]
+        for content, expected in cases:
+            with self.subTest(content=content), patch.object(
+                bot, "APP_ID", "1903707124"
+            ), patch.object(
+                bot, "process_message", new_callable=AsyncMock
+            ) as process:
+                await bot.handle_group_message(
+                    {**self.data, "id": content, "content": content}, GROUP_MESSAGE_CREATE
+                )
+                process.assert_awaited_once()
+                self.assertEqual(process.call_args.args[1], expected)
+                self.assertNotIn("commands_only", process.call_args.args[0])
+
+    async def test_full_message_numeric_mention_helper(self):
+        with patch.object(bot, "APP_ID", "1903707124"):
+            at_bot, rest = bot._split_full_message_at_bot("<@1903707124> 签到")
+            self.assertTrue(at_bot)
+            self.assertEqual(rest, "签到")
+        at_bot, rest = bot._split_full_message_at_bot("<@70837E14CB5C03BDE726DA206C96B6C6> 签到")
+        self.assertFalse(at_bot)
+        at_bot, rest = bot._split_full_message_at_bot("<@999999> /4399")
+        self.assertTrue(at_bot)
+        self.assertEqual(rest, "/4399")
+        at_bot, rest = bot._split_full_message_at_bot("签到")
+        self.assertFalse(at_bot)
+
     async def test_ignored_full_event_does_not_suppress_later_at_event(self):
         data = {**self.data, "content": "你好"}
         with patch.object(bot, "process_message", new_callable=AsyncMock) as process:
