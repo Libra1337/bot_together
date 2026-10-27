@@ -2792,10 +2792,19 @@ async def process_message(ctx, content):
 _BOT_MENTION_RE = re.compile(r"^\s*<@!?([0-9A-Za-z]{4,32})>\s*")
 
 
-def _split_full_message_at_bot(content: str) -> tuple[bool, str]:
+def _bot_mention_ids() -> dict[str, str]:
+    """每个群学到的 机器人被@ID（全量模式下 @机器人 用 32 位 bot openid，与成员同格式）"""
+    data = _identity_map.get("_bot_mentions")
+    return data if isinstance(data, dict) else {}
+
+
+def _split_full_message_at_bot(content: str, group_openid: str = "") -> tuple[bool, str]:
     """
-    全量消息开头的 @机器人 前缀识别：机器人以数字 appid 被 @，
-    群成员是 32 位十六进制 openid，据此区分 @我 和 @别人。
+    全量消息开头的 @机器人 前缀识别。机器人的 @ID 与成员 openid 同为 32 位十六进制，
+    无法靠格式区分，采用学习式：
+    - 已学习的本群/跨群机器人 ID 或数字 appid → 是@我
+    - 未知 ID + 斜杠指令（几乎必然发给机器人）→ 学习并视为@我
+    - 已知是某成员的 openid → 不是@我
     返回 (是否@了机器人, 去掉前缀后的内容)
     """
     text = str(content or "")
@@ -2804,9 +2813,19 @@ def _split_full_message_at_bot(content: str) -> tuple[bool, str]:
         return False, text
     token = match.group(1)
     rest = text[match.end():].strip()
-    if token == str(APP_ID) or (token.isdigit() and rest.startswith("/")):
+    known_ids = set(_bot_mention_ids().values())
+    if token and (token == str(APP_ID) or token in known_ids):
         return True, rest
-    _log.debug(f"[全量@识别] 非机器人前缀 token={token[:8]}... rest={rest[:20]}")
+    if rest.startswith("/") and token and token not in _identity_map:
+        mentions = _bot_mention_ids()
+        mentions[group_openid] = token
+        _identity_map["_bot_mentions"] = mentions
+        _save_identity(_identity_map)
+        _log.info(
+            f"[全量@识别] 学习机器人@id group={group_openid[:8]}... id={token[:8]}..."
+        )
+        return True, rest
+    _log.info(f"[全量@识别] 非机器人前缀 token={token[:8]}... rest={rest[:20]}")
     return False, text
 
 
@@ -2821,7 +2840,13 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
     # 全量模式下平台不再下发 GROUP_AT 事件，@机器人的消息
     # 以 GROUP_MESSAGE_CREATE 到达且内容带 <@id> 前缀：识别并按@消息处理
     if event.is_full_message and not event.is_at:
-        at_bot, stripped = _split_full_message_at_bot(event.content)
+        _log.info(
+            f"[全量消息] group={event.group_openid[:8]}... "
+            f"user={event.user_openid[:8]}... raw={event.raw_content[:80]!r}"
+        )
+        at_bot, stripped = _split_full_message_at_bot(
+            event.content, event.group_openid
+        )
         if at_bot:
             event = dataclasses_replace(event, content=stripped, is_at=True)
 

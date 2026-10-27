@@ -54,6 +54,8 @@ class FullMessageCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(content=content), patch.object(
                 bot, "APP_ID", "1903707124"
             ), patch.object(
+                bot, "_identity_map", {}
+            ), patch.object(
                 bot, "process_message", new_callable=AsyncMock
             ) as process:
                 await bot.handle_group_message(
@@ -64,16 +66,37 @@ class FullMessageCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("commands_only", process.call_args.args[0])
 
     async def test_full_message_numeric_mention_helper(self):
-        with patch.object(bot, "APP_ID", "1903707124"):
-            at_bot, rest = bot._split_full_message_at_bot("<@1903707124> 签到")
+        with patch.object(bot, "APP_ID", "1903707124"), patch.object(
+            bot, "_identity_map", {}
+        ):
+            at_bot, rest = bot._split_full_message_at_bot("<@1903707124> 签到", "group-a")
             self.assertTrue(at_bot)
             self.assertEqual(rest, "签到")
-        at_bot, rest = bot._split_full_message_at_bot("<@70837E14CB5C03BDE726DA206C96B6C6> 签到")
-        self.assertFalse(at_bot)
-        at_bot, rest = bot._split_full_message_at_bot("<@999999> /4399")
-        self.assertTrue(at_bot)
-        self.assertEqual(rest, "/4399")
-        at_bot, rest = bot._split_full_message_at_bot("签到")
+            # 未知 32 位 id + 斜杠指令 → 学习并识别为@机器人
+            at_bot, rest = bot._split_full_message_at_bot(
+                "<@B8142D4E418090CD8D904B00948A3244> /4399", "group-a"
+            )
+            self.assertTrue(at_bot)
+            self.assertEqual(rest, "/4399")
+            self.assertEqual(
+                bot._identity_map["_bot_mentions"]["group-a"],
+                "B8142D4E418090CD8D904B00948A3244",
+            )
+            # 已学习后，无斜杠指令也能识别
+            at_bot, rest = bot._split_full_message_at_bot(
+                "<@B8142D4E418090CD8D904B00948A3244> 签到", "group-a"
+            )
+            self.assertTrue(at_bot)
+            self.assertEqual(rest, "签到")
+        # 已知成员 openid 的@不是@机器人
+        with patch.object(bot, "APP_ID", "1903707124"), patch.object(
+            bot, "_identity_map", {"70837E14CB5C03BDE726DA206C96B6C6": "union-x", "_bot_mentions": {}}
+        ):
+            at_bot, rest = bot._split_full_message_at_bot(
+                "<@70837E14CB5C03BDE726DA206C96B6C6> 签到", "group-a"
+            )
+            self.assertFalse(at_bot)
+        at_bot, rest = bot._split_full_message_at_bot("签到", "group-a")
         self.assertFalse(at_bot)
 
     async def test_ignored_full_event_does_not_suppress_later_at_event(self):
