@@ -2796,6 +2796,17 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         )
         return
 
+    # 身份学习与拉群奖励挂账处理先于闲聊过滤：
+    # 开启全量消息后，邀请者在群里随便说一句话即可激活奖励到账
+    awarded = resolve_message_identity(event)
+    if awarded:
+        await reply(
+            event.to_ctx(),
+            f"拉群奖励 +{awarded} 积分已到账喵~当前积分：{get_user_points(_account_key(event.limit_user_id))}",
+        )
+    if event.msg_id:
+        await notify_pending_group_reward(event.group_openid, event.msg_id)
+
     if event.is_full_message and not event.is_at and not _is_group_command(event.to_ctx(), event.content):
         return
 
@@ -2811,14 +2822,6 @@ async def handle_group_message(data, event_type=GROUP_AT_MESSAGE_CREATE):
         f"user={event.user_openid[:8]}... images={len(event.image_urls)}: "
         f"{event.content[:50]}"
     )
-    awarded = resolve_message_identity(event)
-    if awarded:
-        await reply(
-            event.to_ctx(),
-            f"拉群奖励 +{awarded} 积分已到账喵~当前积分：{get_user_points(_account_key(event.limit_user_id))}",
-        )
-    if event.msg_id:
-        await notify_pending_group_reward(event.group_openid, event.msg_id)
     await process_message(event.to_ctx(), event.content)
 
 
