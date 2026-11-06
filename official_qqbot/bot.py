@@ -3080,13 +3080,17 @@ async def handle_qq_webhook_payload(payload: dict, app_secret: str | None = None
     if payload.get("op") == 13 and isinstance(data, dict) and "event_ts" in data and "plain_token" in data:
         plain_token = str(data.get("plain_token", ""))
         event_ts = str(data.get("event_ts", ""))
+        # 平台回调地址校验要求 op-12 应答格式
         return {
-            "plain_token": plain_token,
-            "signature": _build_qq_webhook_signature(
-                app_secret or APP_SECRET,
-                event_ts,
-                plain_token,
-            ),
+            "op": 12,
+            "d": {
+                "random_key": plain_token,
+                "evendata": _build_qq_webhook_signature(
+                    app_secret or APP_SECRET,
+                    event_ts,
+                    plain_token,
+                ),
+            },
         }
 
     if payload.get("op") != 0:
