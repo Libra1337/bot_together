@@ -1278,7 +1278,7 @@ def _build_bot_auth_header():
 
 def _build_gateway_auth_header():
     return {
-        "Authorization": f"Bearer {_access_token}",
+        "Authorization": f"QQBot {_access_token}",
         "X-Union-Appid": APP_ID,
         "Content-Type": "application/json",
     }
